@@ -635,7 +635,8 @@ class Fabric:
         cap_id, cmd = catalog.resolve_command(thing, f"{approval.capability}.{approval.command}")
         ctx = self._context(who, thing, cap_id, cmd, approval.args,
                             approved=approval.resolved_assurance or Assurance.NONE)
-        ctx.rate_ok = True  # already counted when the request was made
+        if ctx.rate_code != "agent_suspended":  # the rate budget was spent when the request was made;
+            ctx.rate_ok, ctx.rate_code, ctx.rate_retry_s = True, "ok", 0.0  # a suspension since then still holds
         decision = self.policy.evaluate(ctx)
         if decision.effect != Effect.ALLOW:
             self.audit.append("cancelled", approval=approval.id, agent=approval.agent, thing=thing.id,

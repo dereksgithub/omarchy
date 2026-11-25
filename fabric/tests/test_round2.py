@@ -393,6 +393,18 @@ async def test_B25_a_restart_does_not_lift_the_emergency_stop(make_home):
     assert (await make_home()).fabric.frozen["by"] == "fabric"
 
 
+# ---------------------------------------------------------------- B26: a suspension covers what is already waiting
+async def test_B26_an_approved_request_of_a_suspended_agent_does_not_run(home):
+    pending = await home.do("claude", "kitchen.kettle", "turn_on", reason="tea")
+    for _ in range(10):  # then it loops on something it may not do, and the breaker trips
+        await home.do("claude", "living_room.thermostat", "set_target_temperature", temperature=30)
+    assert "claude" in home.fabric.status()["suspended_agents"]
+    home.fabric.resolve_approval(pending["approval_id"], True, "console:desktop", DESKTOP)
+    final = await home.fabric.approval_status(pending["approval_id"], wait_s=2)
+    assert final["status"] == "cancelled" and final["approval"]["result"]["code"] == "agent_suspended"
+    assert home.value("kitchen.kettle", "on") is False
+
+
 def test_agents_never_learn_a_thing_exists_from_a_removed_event(home):
     home.fabric.remove_thing("sim:entrance.alarm")
     assert not any(e.get("thing") == "sim:entrance.alarm" for e in home.fabric.recent_events(viewer="claude"))
