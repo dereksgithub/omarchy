@@ -24,6 +24,7 @@ class FakeHomeAssistant:
         self.clients: set = set()
         self.server = None
         self.platforms: dict[str, str] = {}  # entity_id -> integration, default "demo"
+        self.registry_denied = False  # as for a token whose user is not an admin
         self.states: dict[str, dict[str, Any]] = {}
         for entity_id, state, attrs in [
             ("light.living_lamp", "off", {"friendly_name": "Living Lamp", "supported_color_modes": ["color_temp", "hs"]}),
@@ -55,6 +56,25 @@ class FakeHomeAssistant:
     async def _send(self, ws, msg: dict[str, Any]) -> None:
         await ws.send(json.dumps(msg))
 
+    async def add_entity(self, entity_id: str, state: str, attributes: dict[str, Any], platform: str) -> None:
+        """A device paired after the fabric connected: HA registers it, then announces it."""
+        self.platforms[entity_id] = platform
+        self.states[entity_id] = {"entity_id": entity_id, "state": state, "attributes": attributes,
+                                  "context": {"id": uuid.uuid4().hex, "user_id": None, "parent_id": None}}
+        await self._announce(entity_id, None, self.states[entity_id])
+
+    def _registry_entry(self, entity_id: str) -> dict[str, Any]:
+        return {"entity_id": entity_id, "device_id": "dev-lamp" if entity_id == "light.living_lamp" else None,
+                "area_id": "garage" if entity_id == "cover.garage" else None,
+                "platform": self.platforms.get(entity_id, "demo"),
+                "disabled_by": "user" if entity_id == "light.disabled_one" else None, "hidden_by": None}
+
+    async def _announce(self, entity_id: str, old: dict[str, Any] | None, new: dict[str, Any]) -> None:
+        for ws, sub_id in list(self.clients):
+            await self._send(ws, {"id": sub_id, "type": "event", "event": {
+                "event_type": "state_changed", "data": {"entity_id": entity_id, "old_state": old, "new_state": new},
+                "origin": "LOCAL", "context": new["context"]}})
+
     async def broadcast_change(self, entity_id: str, state: str, attributes: dict[str, Any] | None = None, *,
                                user_id: str | None = None, parent_id: str | None = None,
                                context_id: str | None = None) -> None:
@@ -64,10 +84,7 @@ class FakeHomeAssistant:
         new["attributes"].update(attributes or {})
         new["context"] = {"id": context_id or uuid.uuid4().hex, "user_id": user_id, "parent_id": parent_id}
         self.states[entity_id] = new
-        for ws, sub_id in list(self.clients):
-            await self._send(ws, {"id": sub_id, "type": "event", "event": {
-                "event_type": "state_changed", "data": {"entity_id": entity_id, "old_state": old, "new_state": new},
-                "origin": "LOCAL", "context": new["context"]}})
+        await self._announce(entity_id, old, new)
 
     async def _apply(self, domain: str, service: str, data: dict[str, Any], entity_id: str, ctx: str) -> None:
         s = self.states[entity_id]
@@ -103,16 +120,22 @@ class FakeHomeAssistant:
                 msg = json.loads(raw)
                 kind, mid = msg["type"], msg["id"]
                 result: Any = None
+                if kind.startswith("config/") and self.registry_denied:
+                    await self._send(ws, {"id": mid, "type": "result", "success": False,
+                                          "error": {"code": "unauthorized", "message": "Unauthorized"}})
+                    continue
                 if kind == "get_config":
                     result = {"unit_system": {"temperature": self.temp_unit}, "version": "2026.11.1"}
                 elif kind == "auth/current_user":
                     result = {"id": self.user_id, "name": "Omarchy Fabric", "is_admin": True}
                 elif kind == "config/entity_registry/list":
-                    result = [{"entity_id": e, "device_id": "dev-lamp" if e == "light.living_lamp" else None,
-                               "area_id": "garage" if e == "cover.garage" else None,
-                               "platform": self.platforms.get(e, "demo"),
-                               "disabled_by": "user" if e == "light.disabled_one" else None, "hidden_by": None}
-                              for e in self.states]
+                    result = [self._registry_entry(e) for e in self.states]
+                elif kind == "config/entity_registry/get":
+                    if msg["entity_id"] not in self.states:
+                        await self._send(ws, {"id": mid, "type": "result", "success": False,
+                                              "error": {"code": "not_found", "message": "Entity not found"}})
+                        continue
+                    result = self._registry_entry(msg["entity_id"])
                 elif kind == "config/area_registry/list":
                     result = [{"area_id": "living_room", "name": "Living Room"}, {"area_id": "garage", "name": "Garage"}]
                 elif kind == "config/device_registry/list":

@@ -9,6 +9,7 @@ import json
 import pytest
 
 from omarchy_fabric import console as console_mod
+from omarchy_fabric.adapters import homeassistant as ha_mod
 from omarchy_fabric.api import Session, dispatch
 from omarchy_fabric.approvals import KEEP_FINAL
 from omarchy_fabric.audit import AuditLog, verify_file
@@ -19,6 +20,7 @@ from omarchy_fabric.model import Assurance, InvalidRequest, InvokeRequest, NotFo
 from omarchy_fabric.rpc import RpcClient, RpcError, RpcServer
 
 from .conftest import BASE, merge
+from .fakes import HA_TOKEN, FakeHomeAssistant
 
 DESKTOP = Assurance.DESKTOP
 DIMMER_PLUG = {"adapters": [{"type": "simulator", "id": "sim", "tick_s": 0, "things": [
@@ -418,6 +420,41 @@ def test_B27_the_ha_token_only_goes_in_plaintext_to_this_machine():
     assert ha(url="wss://ha.example.net/api/websocket").url.startswith("wss://")
     assert ha(url="ws://[::1]:8123/api/websocket", token="t")
     assert ha(url="ws://192.168.1.20:8123/api/websocket", allow_plaintext=True)
+
+
+# ---------------------------------------------------------------- B28: one id per device, or no HA at all
+async def _until(predicate, timeout: float = 3.0) -> bool:
+    for _ in range(int(timeout / 0.02)):
+        if predicate():
+            return True
+        await asyncio.sleep(0.02)
+    return predicate()
+
+
+async def test_B28_ha_stays_unavailable_until_it_can_leave_matter_devices_out(monkeypatch):
+    monkeypatch.setattr(ha_mod, "BACKOFF_S", (0.05,))
+    async with FakeHomeAssistant() as ha:
+        ha.platforms["lock.front_door"] = "matter"  # the Matter adapter has this lock already, as matter:2/1
+        ha.registry_denied = True  # say the fabric's HA user lost its admin rights
+        fabric = Fabric(parse({"audit": {"enabled": False}, "adapters": [
+            {"type": "homeassistant", "id": "ha", "url": ha.url, "token": HA_TOKEN, "exclude_integrations": ["matter"]}]}))
+        await fabric.start()
+        try:
+            assert await _until(lambda: "entity registry" in fabric.adapter_health["ha"]["detail"])
+            assert not fabric.adapter_health["ha"]["connected"] and not fabric.registry.things  # was: all of them
+            ha.registry_denied = False
+            assert await _until(lambda: fabric.adapter_health["ha"]["connected"])
+            assert "ha:lock.front_door" not in fabric.registry.things
+            await ha.add_entity("lock.back_door", "locked", {"friendly_name": "Back door"}, platform="matter")
+            await ha.add_entity("light.porch", "off", {"friendly_name": "Porch", "supported_color_modes": ["onoff"]},
+                                platform="hue")
+            assert await _until(lambda: "ha:light.porch" in fabric.registry.things)
+            assert "ha:lock.back_door" not in fabric.registry.things  # paired after startup, excluded all the same
+        finally:
+            await fabric.stop()
+    with pytest.raises(ValueError):  # a config that turns the registry off cannot exclude anything
+        Fabric(parse({"audit": {"enabled": False}, "adapters": [
+            {"type": "homeassistant", "exclude_integrations": ["matter"], "use_registry": False}]}))
 
 
 def test_agents_never_learn_a_thing_exists_from_a_removed_event(home):

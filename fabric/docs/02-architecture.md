@@ -196,7 +196,7 @@ The Matter adapter speaks the OHF Matter Server WebSocket API (`ws://127.0.0.1:5
 
 ### One path per device
 
-If HA uses the same Matter Server, every Matter device would appear twice (`ha:light.x` and `matter:5/1`), and a lease or human hold on one id would not cover its alias. The node config sets `exclude_integrations = ["matter"]` on the HA adapter so Matter devices come only through the Matter adapter.
+If HA uses the same Matter Server, every Matter device would appear twice (`ha:light.x` and `matter:5/1`), and a lease or human hold on one id would not cover its alias. The node config sets `exclude_integrations = ["matter"]` on the HA adapter so Matter devices come only through the Matter adapter. Only HA's entity registry says which integration an entity belongs to, so with exclusions set the HA adapter stays unavailable while it cannot read the registry (a non-admin token, say), and an entity that appears after startup is looked up there before it is admitted.
 
 ## Threat model
 

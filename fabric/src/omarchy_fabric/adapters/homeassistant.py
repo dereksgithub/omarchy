@@ -219,9 +219,14 @@ class HomeAssistantAdapter(Adapter):
         self.exclude_entities = tuple(o.get("exclude_entities", ()))
         # One path per physical device: when the fabric talks to the Matter server
         # directly, skip HA's view of the same devices (exclude_integrations = ["matter"]),
-        # or a lease / human hold on one id would not cover its alias.
+        # or a lease / human hold on one id would not cover its alias. Only the entity
+        # registry says which integration an entity comes from, so without it the
+        # adapter stays unavailable rather than admit every device a second time.
         self.exclude_integrations = set(o.get("exclude_integrations", ()))
         self.use_registry = bool(o.get("use_registry", True))
+        if self.exclude_integrations and not self.use_registry:
+            raise ValueError(f"adapter {adapter_id!r} (homeassistant): exclude_integrations needs "
+                             "use_registry = true; only the entity registry says where an entity comes from")
         self.alarm_code = o.get("alarm_code")
         self.temp_unit = "°C"
         self._ws = None
@@ -229,6 +234,11 @@ class HomeAssistantAdapter(Adapter):
         self._pending: dict[int, asyncio.Future] = {}
         self._contexts: dict[str, float] = {}  # context ids of our own service calls
         self._meta: dict[str, dict[str, Any]] = {}
+        self._registry_ok = False  # the registry was read this session: new entities are looked up in it
+        self._areas: dict[str, str | None] = {}
+        self._devices: dict[str, dict[str, Any]] = {}
+        self._unvetted: dict[str, dict[str, Any]] = {}  # new entities waiting for their registry entry
+        self._vetting: set[asyncio.Task] = set()
         self._task: asyncio.Task | None = None
         self.ha_version = ""
         self.own_user_id: str | None = None
@@ -303,6 +313,8 @@ class HomeAssistantAdapter(Adapter):
             finally:
                 reader.cancel()
                 self._ws = None
+                self._registry_ok = False
+                self._unvetted.clear()
                 for future in self._pending.values():
                     if not future.done():
                         future.set_exception(AdapterError("connection to Home Assistant lost"))
@@ -319,7 +331,9 @@ class HomeAssistantAdapter(Adapter):
                         future.set_result(msg.get("result"))
                     else:
                         err = msg.get("error") or {}
-                        future.set_exception(AdapterError(f"{err.get('code', 'error')}: {err.get('message', '')}"))
+                        error = AdapterError(f"{err.get('code', 'error')}: {err.get('message', '')}")
+                        error.ha_code = err.get("code")
+                        future.set_exception(error)
             elif kind == "event":
                 self._on_event(msg.get("event") or {})
 
@@ -338,23 +352,45 @@ class HomeAssistantAdapter(Adapter):
             entities = await self._call({"type": "config/entity_registry/list"})
             areas = await self._call({"type": "config/area_registry/list"})
             devices = await self._call({"type": "config/device_registry/list"})
-        except AdapterError:
+        except AdapterError as exc:
+            if self.exclude_integrations:  # without it, excluded devices would come in under a second id
+                raise AdapterError(f"cannot read the entity registry ({exc}), so exclude_integrations "
+                                   "cannot be applied; give the fabric's HA user admin rights") from None
             return {}  # non-admin token: fine, we just lose areas and device info
-        area_names = {a["area_id"]: a.get("name") for a in areas}
-        device_by_id = {d["id"]: d for d in devices}
-        out = {}
-        for e in entities:
-            device = device_by_id.get(e.get("device_id")) or {}
-            area_id = e.get("area_id") or device.get("area_id")
-            out[e["entity_id"]] = {
-                "area": area_names.get(area_id),
-                "manufacturer": device.get("manufacturer"),
-                "model": device.get("model"),
-                "platform": e.get("platform"),
-                "skip": bool(e.get("disabled_by") or e.get("hidden_by")
-                             or e.get("platform") in self.exclude_integrations),
-            }
-        return out
+        self._areas = {a["area_id"]: a.get("name") for a in areas}
+        self._devices = {d["id"]: d for d in devices}
+        self._registry_ok = True
+        return {e["entity_id"]: self._entry_meta(e) for e in entities}
+
+    def _entry_meta(self, e: dict[str, Any]) -> dict[str, Any]:
+        device = self._devices.get(e.get("device_id")) or {}
+        return {
+            "area": self._areas.get(e.get("area_id") or device.get("area_id")),
+            "manufacturer": device.get("manufacturer"),
+            "model": device.get("model"),
+            "platform": e.get("platform"),
+            "skip": bool(e.get("disabled_by") or e.get("hidden_by")
+                         or e.get("platform") in self.exclude_integrations),
+        }
+
+    async def _vet(self, entity_id: str) -> None:
+        """An entity that appeared after startup is admitted only once its registry
+        entry says it is not excluded, exactly as at startup."""
+        try:
+            entry = await self._call({"type": "config/entity_registry/get", "entity_id": entity_id})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # an error reply, a timeout, a lost connection
+            if getattr(exc, "ha_code", None) != "not_found":
+                self._unvetted.pop(entity_id, None)  # cannot tell: leave it out; its next change asks again
+                return
+            entry = {}  # not in the registry at all: no integration to exclude, as at startup
+        state = self._unvetted.pop(entity_id, None)
+        if state is None or self.fabric is None:
+            return  # removed meanwhile, or the session ended
+        self._meta[entity_id] = self._entry_meta(entry or {})
+        if not self._meta[entity_id]["skip"]:
+            self._add(state)
 
     # ------------------------------------------------------------ mapping
     def _included(self, entity_id: str) -> bool:
@@ -423,11 +459,21 @@ class HomeAssistantAdapter(Adapter):
         new = data.get("new_state")
         thing_id = self.thing_id(entity_id)
         if new is None:
+            self._unvetted.pop(entity_id, None)
             self.fabric.remove_thing(thing_id)
             return
         if thing_id not in self.fabric.registry.things:
-            if self._included(entity_id) and not self._meta.get(entity_id, {}).get("skip"):
+            if not self._included(entity_id) or self._meta.get(entity_id, {}).get("skip"):
+                return
+            if entity_id in self._meta or not self._registry_ok:
                 self._add(new)
+            else:  # new since startup: look it up first (not from here, which is the reader itself)
+                first = entity_id not in self._unvetted
+                self._unvetted[entity_id] = new
+                if first:
+                    task = asyncio.ensure_future(self._vet(entity_id))
+                    self._vetting.add(task)
+                    task.add_done_callback(self._vetting.discard)
             return
         mapped = map_entity(new, self.temp_unit)
         if mapped is None:
