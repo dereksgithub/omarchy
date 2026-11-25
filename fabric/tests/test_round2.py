@@ -405,6 +405,21 @@ async def test_B26_an_approved_request_of_a_suspended_agent_does_not_run(home):
     assert home.value("kitchen.kettle", "on") is False
 
 
+# ---------------------------------------------------------------- B27: the HA token stays off the wire
+def test_B27_the_ha_token_only_goes_in_plaintext_to_this_machine():
+    def ha(**options):
+        cfg = parse(merge(BASE, {"adapters": [{"type": "homeassistant", "id": "ha", **options}]}))
+        return Fabric(cfg).adapters["ha"]
+
+    assert ha().url == "ws://127.0.0.1:8123/api/websocket"  # was ws://homeassistant.local: across the LAN
+    with pytest.raises(ValueError) as err:
+        ha(url="ws://homeassistant.local:8123/api/websocket")
+    assert "plaintext" in str(err.value) and "allow_plaintext" in str(err.value)
+    assert ha(url="wss://ha.example.net/api/websocket").url.startswith("wss://")
+    assert ha(url="ws://[::1]:8123/api/websocket", token="t")
+    assert ha(url="ws://192.168.1.20:8123/api/websocket", allow_plaintext=True)
+
+
 def test_agents_never_learn_a_thing_exists_from_a_removed_event(home):
     home.fabric.remove_thing("sim:entrance.alarm")
     assert not any(e.get("thing") == "sim:entrance.alarm" for e in home.fabric.recent_events(viewer="claude"))

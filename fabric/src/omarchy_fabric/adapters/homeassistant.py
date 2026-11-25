@@ -9,15 +9,21 @@ know of (a wall switch: external).
 
 Use a dedicated HA user and long-lived token for the fabric, and expose only
 the entities you want agents to see (include_domains / include_entities).
+
+The token opens the whole house, so it only travels in plaintext to this
+machine: the default is the HA on the node itself, and any other host needs
+wss://, or allow_plaintext = true where the network between them is trusted.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import time
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..model import ORIGIN_AUTOMATION, ORIGIN_FABRIC, ORIGIN_HUMAN, Thing
 from ..util import glob
@@ -32,6 +38,25 @@ COVER_STATES = ("open", "closed", "opening", "closing")
 HVAC_MODES = ("off", "heat", "cool", "auto", "heat_cool", "fan_only", "dry")
 ALARM_STATES = ("disarmed", "armed_home", "armed_away", "armed_night", "arming", "pending", "triggered")
 BACKOFF_S = (1, 2, 5, 10, 30, 60)
+DEFAULT_URL = "ws://127.0.0.1:8123/api/websocket"
+
+
+def plaintext_problem(url: str) -> str | None:
+    """Why the token must not go to this URL in the clear, or None when it may."""
+    parts = urlsplit(url)
+    if parts.scheme == "wss":
+        return None
+    if parts.scheme != "ws":
+        return f"{url} is not a WebSocket URL (ws:// or wss://)"
+    host = parts.hostname or ""
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if loopback:
+        return None
+    return (f"{url} would send the Home Assistant token in plaintext to {host or 'another host'}; "
+            "use wss://, or set allow_plaintext = true if the network in between is trusted")
 
 
 def _num(value: Any) -> float | None:
@@ -176,14 +201,17 @@ def service_for(entity_id: str, capability: str, command: str, args: dict[str, A
 class HomeAssistantAdapter(Adapter):
     type = "homeassistant"
     OPTIONS = frozenset({"url", "token", "token_file", "include_domains", "include_entities", "exclude_entities",
-                         "exclude_integrations", "use_registry", "alarm_code"})
+                         "exclude_integrations", "use_registry", "alarm_code", "allow_plaintext"})
 
     def __init__(self, adapter_id: str, options: dict[str, Any] | None = None):
         super().__init__(adapter_id, options)
         from ..config import expand
 
         o = self.options
-        self.url = o.get("url", "ws://homeassistant.local:8123/api/websocket")
+        self.url = str(o.get("url", DEFAULT_URL))
+        problem = plaintext_problem(self.url)
+        if problem and not (o.get("allow_plaintext") is True and self.url.startswith("ws://")):
+            raise ValueError(f"adapter {adapter_id!r} (homeassistant): {problem}")
         self.token = o.get("token")
         self.token_file = expand(o["token_file"]) if o.get("token_file") else None
         self.include_domains = set(o.get("include_domains", DEFAULT_DOMAINS))
