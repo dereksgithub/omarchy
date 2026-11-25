@@ -1,0 +1,59 @@
+name: Fabric
+
+# Runs the omarchy-fabric test suite (fabric/tests) for the fabric/** branches
+# of this fork. Python 3.11 is what the Raspberry Pi node runs; 3.x is the
+# newest stable release, since pyproject sets no upper bound. The package is
+# installed non-editable with its dev extra, the way deploy/pi5/bootstrap.sh
+# installs it, so a file missing from the wheel fails here too.
+
+on:
+  pull_request:
+    branches: ['fabric/**']
+    paths:
+      - 'fabric/**'
+      - '.github/workflows/fabric.yml'
+  push:
+    branches: ['fabric/**']
+    paths:
+      - 'fabric/**'
+      - '.github/workflows/fabric.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fabric-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.x']
+    defaults:
+      run:
+        working-directory: fabric
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: fabric
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: fabric/pyproject.toml
+
+      - name: Install omarchy-fabric with its dev extra
+        run: |
+          python --version
+          python -m pip install --upgrade pip
+          python -m pip install '.[dev]'
+
+      - name: Run tests
+        run: python -m pytest -q
