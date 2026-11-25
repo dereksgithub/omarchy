@@ -1,5 +1,6 @@
 """Round 2: one test per defect the audit found in round 1 (docs/07-audit.md, B-numbers),
-plus the scoping and transport hardening that came with fixing them."""
+plus the scoping and transport hardening that came with fixing them. B25 onwards are
+the automated review's leads on round 1 that round 2 left open (fixed in round 3)."""
 
 from __future__ import annotations
 

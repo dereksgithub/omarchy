@@ -25,7 +25,7 @@ Written 2026-11-22 on branch `fabric/round-2`. Three things were audited: the vi
 
 ## Defects found in round 1
 
-Each fixed item has a test named after it in `tests/test_round2.py`.
+Each fixed item has a test named after it in `tests/test_round2.py`. B25–B32 are leads from an automated review (Greptile) of round 1 that round 2 left open. Each was checked against the code at `f2fb136` and fixed on `fabric/round-3`, except B31, which round 2 had already fixed.
 
 | # | Defect | State |
 |---|---|---|
@@ -53,6 +53,14 @@ Each fixed item has a test named after it in `tests/test_round2.py`.
 | B22 | Approvals, freezes and suspensions were silenced by Do Not Disturb | Fixed, configurable (`console.through_dnd`) |
 | B23 | Agent text could add markup and links to the card, or make Omarchy offer "copy code" buttons that renumber Approve | Fixed |
 | B24 | Cards were dismissed by a truncated substring that rarely matched, and stale Approve buttons survived a shell restart | Fixed: cards are transient and replaced in place |
+| B25 | The emergency stop lived only in memory: a restart, crash or power cut lifted it | Fixed: kept in `emergency-stop.json` in the state directory and restored before adapters start or RPC takes requests; an unreadable file counts as a stop |
+| B26 | An agent suspended by the breaker still had its already-approved requests run: the approval re-check cleared the suspension along with the rate budget | Fixed: only the rate budget counted at request time is skipped |
+| B27 | The HA adapter's default URL was `ws://homeassistant.local`, sending the long-lived token across the LAN in plaintext | Fixed: defaults to `127.0.0.1`; plaintext to any other host needs `allow_plaintext = true`, otherwise `wss://` |
+| B28 | A failed HA registry read (a non-admin token) disabled `exclude_integrations`, and entities created after startup skipped it too, so Matter devices also appeared under an `ha:` id that dodged the other id's lease, hold and load class | Fixed: with exclusions set, the adapter stays unavailable until it can read the registry, and looks up each new entity before admitting it |
+| B29 | The console took its snapshot before it subscribed, so a request or freeze in between got no card, nor did requests made while it was disconnected | Fixed: subscribes first, then reconciles cards and the freeze notice against the snapshot |
+| B30 | `console.notify = false` was ignored: only `--quiet` turned notifications off | Fixed |
+| B31 | A clean WebSocket close left HA, and Matter, marked connected | Not a defect at `f2fb136`: round 2 already reports the adapter down when a session ends cleanly, in both adapters |
+| B32 | Every Matter attribute update re-sent the whole endpoint, so a reading that had stopped arriving looked fresh whenever anything else on the endpoint changed | Fixed: an update refreshes only the attributes the reported Matter attribute feeds |
 
 Known limit, unchanged: on one machine an agent with shell access is the same user as you, and on a node it can still use the console's SSH key if that key is readable. `desktop` assurance is only as strong as the separation between agents and console credentials.
 
@@ -86,4 +94,4 @@ These came from the static check against upstream and are still open in `omarchy
 - `README.md` and docs 02, 04, 05 and 06 still describe round 1 (test counts, scenarios, `ofab do` semantics).
 - `examples/` and `deploy/pi5/node.toml` have no rules or presence examples.
 - No independent review of this round's diff; not run on Python 3.11 (the Pi's version); nothing run on hardware or on Omarchy.
-- Nothing is committed.
+- Committed: round 2 is on `fabric/round-2` (`f5b8ba0`, `f2fb136`), under review as a PR into `fabric/main` in the fork. The B25–B32 fixes are on `fabric/round-3`, one commit each.
