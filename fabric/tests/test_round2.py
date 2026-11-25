@@ -379,6 +379,20 @@ async def test_B24_a_resolved_request_replaces_its_card(omarchy_desktop, monkeyp
     assert len(sent) == 2  # nothing left to replace
 
 
+# ================================================================ B25 - B32: leads from the automated review of round 1
+# ---------------------------------------------------------------- B25: the emergency stop outlives a restart
+async def test_B25_a_restart_does_not_lift_the_emergency_stop(make_home):
+    before = await make_home()
+    before.fabric.freeze("gpio:kill", "physical kill switch")
+    after = await make_home()  # the same state directory: the node came back after a power cut
+    assert after.fabric.frozen["by"] == "gpio:kill" and after.fabric.frozen["reason"] == "physical kill switch"
+    assert (await after.do("claude", "kitchen.kettle", "turn_on"))["code"] == "frozen"
+    after.fabric.thaw("console:desktop")
+    assert (await make_home()).fabric.frozen is None
+    after.fabric.config.stop_path.write_text("{torn")  # a stop file nobody can read still counts as a stop
+    assert (await make_home()).fabric.frozen["by"] == "fabric"
+
+
 def test_agents_never_learn_a_thing_exists_from_a_removed_event(home):
     home.fabric.remove_thing("sim:entrance.alarm")
     assert not any(e.get("thing") == "sim:entrance.alarm" for e in home.fabric.recent_events(viewer="claude"))
