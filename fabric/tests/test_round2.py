@@ -18,9 +18,10 @@ from omarchy_fabric.fabric import Fabric
 from omarchy_fabric.mcp_server import RemoteBackend
 from omarchy_fabric.model import Assurance, InvalidRequest, InvokeRequest, NotFound, PermissionDenied, Thing
 from omarchy_fabric.rpc import RpcClient, RpcError, RpcServer
+from omarchy_fabric.util import FakeClock
 
 from .conftest import BASE, merge
-from .fakes import HA_TOKEN, FakeHomeAssistant
+from .fakes import HA_TOKEN, FakeHomeAssistant, FakeMatterServer
 
 DESKTOP = Assurance.DESKTOP
 DIMMER_PLUG = {"adapters": [{"type": "simulator", "id": "sim", "tick_s": 0, "things": [
@@ -515,6 +516,25 @@ async def test_B30_the_console_honours_notify_false_in_the_config(monkeypatch):
     assert made["notify"] is False  # only --quiet used to count
     await cmd_console(build_parser().parse_args(["console"]), parse({}))
     assert made["notify"] is True
+
+
+# ---------------------------------------------------------------- B32: a Matter reading ages unless it is reported
+async def test_B32_a_matter_update_refreshes_only_what_it_reports():
+    clock = FakeClock()
+    async with FakeMatterServer() as server:
+        fabric = Fabric(parse({"audit": {"enabled": False}, "adapters": [{"type": "matter", "url": server.url}]}),
+                        clock=clock)
+        await fabric.start()
+        try:
+            assert await _until(lambda: fabric.adapter_health["matter"]["connected"])
+            clock.advance(1000)  # the thermostat's sensor has gone quiet for longer than stale_after_s
+            await server.set_attribute(4, "1/513/18", 2100)  # someone changes the heating setpoint
+            assert await _until(lambda: fabric.registry.values("matter:4/1").get("target_temperature") == 21.0)
+            attrs = fabric.get_state("matter:4/1")["attributes"]
+            assert attrs["current_temperature"].get("stale") is True  # was refreshed along with the setpoint
+            assert attrs["target_temperature"]["age_s"] == 0
+        finally:
+            await fabric.stop()
 
 
 def test_agents_never_learn_a_thing_exists_from_a_removed_event(home):
