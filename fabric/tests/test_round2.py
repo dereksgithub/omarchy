@@ -298,6 +298,16 @@ async def test_B20_the_mcp_proxy_survives_a_daemon_restart(home, short_tmp):
         await server.stop()
 
 
+def test_the_documented_mcp_registration_parses():
+    from omarchy_fabric.cli import build_parser
+
+    # The installer, the Pi runbook and the console example all print `ofab mcp --connect ...`
+    args = build_parser().parse_args(["mcp", "--connect", "ssh://fabric-claude"])
+    assert args.connect == "ssh://fabric-claude"  # used to exit: unrecognized arguments
+    args = build_parser().parse_args(["--connect", "ssh://fabric-claude", "mcp"])
+    assert args.connect == "ssh://fabric-claude"  # the subcommand's option must not blank the global one
+
+
 # ---------------------------------------------------------------- B21 - B24: the approval card
 @pytest.fixture
 def omarchy_desktop(monkeypatch):
