@@ -158,7 +158,10 @@ class Console:
         self.client: RpcClient | None = None
         self.here = True  # someone is at this desktop (until told otherwise)
         self.audit_alert: str | None = None
-        self._cards: dict[str, int] = {}  # approval id -> notification id, to replace the card later
+        # approval id -> (notification id, summary): to replace the card later. Kept
+        # across reconnects, so a card for a request that went away meanwhile is closed.
+        self._cards: dict[str, tuple[int | None, str]] = {}
+        self._told_frozen: tuple[str, str] | None = None  # the freeze this desktop was told about
         self._waited = False
         self._wants: asyncio.Queue[str] = asyncio.Queue()
 
@@ -167,7 +170,7 @@ class Console:
         return self._room() if callable(self._room) else self._room
 
     # ------------------------------------------------------------ status file
-    async def refresh(self) -> None:
+    async def refresh(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         assert self.client is not None
         status = await self.client.call("status")
         approvals = (await self.client.call("approvals"))["approvals"]
@@ -187,6 +190,27 @@ class Console:
             "warning": status.get("warning"),
             "audit_alert": self.audit_alert,
         })
+        return status, approvals
+
+    async def _reconcile(self) -> None:
+        """Line the desktop up with a fresh snapshot, taken only once events flow:
+        a card for every request that waits, including those made while this console
+        was away; none left for a request that is gone; and a word if the fabric is
+        frozen. Anything newer than the snapshot arrives as an event."""
+        status, approvals = await self.refresh()
+        if not self.notify:
+            return
+        waiting = {str(a.get("id", "")): a for a in approvals}
+        for approval_id in [i for i in self._cards if i not in waiting]:
+            await self._approval_resolved({"id": approval_id, "status": "closed"})
+        for approval_id, approval in waiting.items():
+            if approval_id not in self._cards:
+                await self._show_card(approval)
+        frozen = status.get("frozen")
+        if frozen:
+            await self._frozen(frozen)
+        else:
+            self._told_frozen = None
 
     # ------------------------------------------------------------ audit witness
     def _witness(self) -> dict[str, Any]:
@@ -315,31 +339,45 @@ class Console:
         return notify_command(headline, "\n".join(lines), actions, with_args=[approval_id], urgency="critical",
                               alarm=True, through_dnd=self.through_dnd, transient=True, want_id=True)
 
+    async def _show_card(self, a: dict[str, Any]) -> None:
+        printed = await self._send(self._approval_card(a),
+                                   f"approval {a.get('id')} needed ({a.get('requires')}): "
+                                   f"{clean_text(a.get('summary', ''), 120)}", capture=True)
+        self._cards[str(a.get("id", ""))] = (int(printed) if printed.isdigit() else None, str(a.get("summary", "")))
+
     async def _approval_resolved(self, a: dict[str, Any]) -> None:
-        card = self._cards.pop(str(a.get("id", "")), None)
+        card, summary = self._cards.pop(str(a.get("id", "")), (None, ""))
         if card is None:
             return
         status = str(a.get("status", ""))
         word = {"approved": "Approved", "executed": "Done", "denied": "Denied", "expired": "Expired",
                 "cancelled": "Cancelled", "failed": "Failed"}.get(status, "Closed")
-        await self._send(notify_command(f"{word}: {toast_text(a.get('summary', ''), 90)}", "", urgency="low",
-                                        transient=True, replace=card),
+        await self._send(notify_command(f"{word}: {toast_text(a.get('summary') or summary, 90)}", "",
+                                        urgency="low", transient=True, replace=card),
                          f"approval {a.get('id')} {status}")
+
+    async def _frozen(self, event: dict[str, Any]) -> None:
+        told = (str(event.get("by", "")), str(event.get("reason", "")))
+        if told == self._told_frozen:  # seen in the snapshot already, or the other way round
+            return
+        self._told_frozen = told
+        await self._send(notify_command(
+            "Fabric frozen", f"By {toast_text(event.get('by', ''), 80)}. Reason: {toast_text(event.get('reason', ''))}",
+            urgency="critical", alarm=True, through_dnd=self.through_dnd, transient=True),
+            f"frozen by {event.get('by')}: {event.get('reason')}")
 
     async def handle(self, event: dict[str, Any]) -> None:
         kind = event.get("type")
         if kind in ("approval_requested", "approval_resolved", "freeze", "thaw", "adapter", "agent_suspended",
                     "availability", "thing_added", "thing_removed", "rule"):
             await self.refresh()
+        if kind == "thaw":
+            self._told_frozen = None
         if not self.notify:
             return
         if kind == "approval_requested":
-            a = event["approval"]
-            printed = await self._send(self._approval_card(a),
-                                       f"approval {a.get('id')} needed ({a.get('requires')}): "
-                                       f"{clean_text(a.get('summary', ''), 120)}", capture=True)
-            if printed.isdigit():
-                self._cards[str(a.get("id"))] = int(printed)
+            if str(event["approval"].get("id", "")) not in self._cards:  # else the snapshot showed it first
+                await self._show_card(event["approval"])
         elif kind == "approval_resolved":
             await self._approval_resolved(event["approval"])
         elif kind == "action" and event.get("status") == "executed":
@@ -369,10 +407,7 @@ class Console:
                 urgency="critical", alarm=True, through_dnd=self.through_dnd, transient=True),
                 "the approve button refused a request that replaced a lapsed one")
         elif kind == "freeze":
-            await self._send(notify_command(
-                "Fabric frozen", f"By {toast_text(event.get('by', ''), 80)}. Reason: {toast_text(event.get('reason', ''))}",
-                urgency="critical", alarm=True, through_dnd=self.through_dnd, transient=True),
-                f"frozen by {event.get('by')}: {event.get('reason')}")
+            await self._frozen(event)
 
     # ------------------------------------------------------------ main loop
     async def run(self) -> None:
@@ -389,10 +424,12 @@ class Console:
                 try:
                     self.client = await RpcClient.connect(self.target, role="console", agent="desktop")
                     attempt = 0
-                    self._cards.clear()
+                    # Subscribe before the first look: whatever happens after it then
+                    # arrives as an event, so no request or freeze falls in between.
+                    await self.client.subscribe()
                     await self._check_witness()
                     await self._claim()
-                    await self.refresh()
+                    await self._reconcile()
                     async for event in self.client.events():
                         await self.handle(event)
                 except (RpcError, OSError) as exc:

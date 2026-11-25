@@ -457,6 +457,46 @@ async def test_B28_ha_stays_unavailable_until_it_can_leave_matter_devices_out(mo
             {"type": "homeassistant", "exclude_integrations": ["matter"], "use_registry": False}]}))
 
 
+# ---------------------------------------------------------------- B29: a console misses nothing while it connects
+async def test_B29_a_request_made_while_the_console_connects_gets_a_card(home, short_tmp, omarchy_desktop,
+                                                                          monkeypatch):
+    monkeypatch.setattr(console_mod.shutil, "which", lambda name: None if name == "dbus-monitor" else f"/usr/bin/{name}")
+    sent = []
+
+    async def fake_run(cmd, fallback="", capture=False):
+        sent.append(cmd)
+        return str(len(sent)) if capture else ""
+
+    monkeypatch.setattr(console_mod, "_run", fake_run)
+    rpc = RpcConfig(socket=short_tmp / "fabric.sock", local_assurance=DESKTOP)
+    server = RpcServer(home.fabric, rpc)
+    await server.start()
+    away = await home.do("claude", "kitchen.kettle", "turn_on", reason="tea")  # asked before the console came up
+    console = console_mod.Console(str(rpc.socket), short_tmp / "status.json")
+    console._waited = True
+    snapshot, meanwhile = console.refresh, {}
+
+    async def refresh():
+        taken = await snapshot()
+        if not meanwhile:  # straight after the console's first look, where it used to subscribe only later
+            meanwhile.update(await home.do("codex", "kitchen.kettle", "turn_on", reason="more tea"))
+        return taken
+
+    console.refresh = refresh
+    task = asyncio.ensure_future(console.run())
+
+    def carded(approval_id: str) -> bool:
+        return any(cmd and cmd[-2:] == ["--with", approval_id] for cmd in sent)
+
+    try:
+        assert await _until(lambda: bool(meanwhile) and carded(meanwhile["approval_id"]))
+        assert carded(away["approval_id"])
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await server.stop()
+
+
 def test_agents_never_learn_a_thing_exists_from_a_removed_event(home):
     home.fabric.remove_thing("sim:entrance.alarm")
     assert not any(e.get("thing") == "sim:entrance.alarm" for e in home.fabric.recent_events(viewer="claude"))
