@@ -49,16 +49,29 @@ def iso(ts: float) -> str:
 # ---------------------------------------------------------------- matching
 
 
+def slug(text: object, keep: str = "") -> str:
+    """"Living Room" -> "living_room". Rooms are compared by slug, so Home Assistant's
+    area names and the ids people type in a config mean the same room."""
+    return re.sub(rf"[^a-z0-9{re.escape(keep)}]+", "_", str(text or "").lower()).strip("_")
+
+
 def match_thing(pattern: str, thing) -> bool:
-    """Patterns: "*", "ha:light.*" (id glob), "area:kitchen", "kind:heater", "tag:x"."""
+    """Patterns: "*", "ha:light.*" (id glob), "area:kitchen", "kind:heater", "tag:x",
+    "cap:on_off". Join terms with "&" to require all of them: "area:office&kind:light"."""
+    if "&" in pattern:
+        return all(match_thing(term.strip(), thing) for term in pattern.split("&"))
     if pattern in ("*", ""):
         return True
     if pattern.startswith("area:"):
-        return fnmatch.fnmatchcase((thing.area or "").lower(), pattern[5:].lower())
+        area = thing.area or ""
+        return (fnmatch.fnmatchcase(area.lower(), pattern[5:].lower())
+                or fnmatch.fnmatchcase(slug(area), slug(pattern[5:], keep="*?[]")))
     if pattern.startswith("kind:"):
         return fnmatch.fnmatchcase(thing.kind or "", pattern[5:])
     if pattern.startswith("tag:"):
         return any(fnmatch.fnmatchcase(t, pattern[4:]) for t in thing.tags)
+    if pattern.startswith("cap:"):
+        return any(fnmatch.fnmatchcase(c, pattern[4:]) for c in thing.capabilities)
     return fnmatch.fnmatchcase(thing.id, pattern)
 
 
@@ -98,6 +111,16 @@ def looks_like_injection(text: object) -> bool:
 
 
 # ---------------------------------------------------------------- ids
+
+# Agent, person and rule names end up in policy lookups, audit records, notifications
+# and principal ids ("human:desktop", "rule:leak-shutoff"). A fixed alphabet keeps a
+# self-declared name from posing as another kind of principal or smuggling an option.
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def valid_name(text: object) -> bool:
+    return isinstance(text, str) and bool(_NAME.fullmatch(text))
+
 
 _ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I: easy to read aloud and type
 

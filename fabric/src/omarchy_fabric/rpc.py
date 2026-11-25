@@ -27,9 +27,9 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from . import __version__
-from .api import ROLES, Session, dispatch
+from .api import ROLES, Session, dispatch, end_session
 from .model import Assurance, FabricError, PermissionDenied
-from .util import clean_text
+from .util import valid_name
 
 log = logging.getLogger("omarchy_fabric.rpc")
 MAX_LINE = 1 << 20
@@ -91,7 +91,9 @@ class RpcServer:
             role = params.get("role", "agent")
             if role not in ROLES:
                 raise PermissionDenied(f"unknown role {role!r}")
-            agent = clean_text(params.get("agent") or ("console" if role != "agent" else "local-agent"), 64)
+            agent = params.get("agent") or ("console" if role != "agent" else "local-agent")
+            if not valid_name(agent):  # it becomes a policy key, an audit field and part of principal ids
+                raise PermissionDenied("an agent name is 1-64 letters, digits, '.', '_' or '-'")
             assurance = self.config.local_assurance if role != "agent" else Assurance.NONE
             return Session(role, agent, assurance, "unix")
         token = str(params.get("token") or "")
@@ -129,7 +131,13 @@ class RpcServer:
                     await send({"error": {"code": "invalid", "message": "not a JSON object"}})
                     continue
                 if name == "hello":
+                    if session is not None:  # an identity is for the life of a connection
+                        await send({"id": mid, "error": {"code": "forbidden",
+                                                         "message": "this connection already said hello"}})
+                        continue
                     try:
+                        if not isinstance(params, dict):
+                            raise PermissionDenied("hello needs an object of parameters")
                         session = self._authenticate(transport, params)
                     except FabricError as exc:
                         await send({"id": mid, "error": {"code": exc.code, "message": str(exc)}})
@@ -145,12 +153,10 @@ class RpcServer:
                         queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
                         hidden_ok = session.at_least("console")
 
-                        def listener(event: dict[str, Any], q=queue, hidden_ok=hidden_ok) -> None:
-                            tid = event.get("thing")
-                            if tid and not hidden_ok:
-                                thing = self.fabric.registry.get(tid)
-                                if thing is not None and not thing.expose:
-                                    return
+                        def listener(event: dict[str, Any], q=queue, hidden_ok=hidden_ok,
+                                     viewer=session.viewer) -> None:
+                            if not self.fabric.event_visible(event, viewer, hidden_ok):
+                                return
                             try:
                                 q.put_nowait(event)
                             except asyncio.QueueFull:
@@ -176,6 +182,8 @@ class RpcServer:
                 pump.cancel()
             for task in tasks:
                 task.cancel()
+            if session is not None:
+                end_session(self.fabric, session)
             writer.close()
 
     async def _handle(self, send, session: Session, mid: Any, name: str, params: dict[str, Any]) -> None:
@@ -235,7 +243,12 @@ class RpcClient:
     async def _read(self) -> None:
         try:
             while line := await self.reader.readline():
-                msg = json.loads(line)
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:  # e.g. an ssh banner ahead of the RPC stream
+                    continue
+                if not isinstance(msg, dict):
+                    continue
                 if "event" in msg:
                     await self._events.put(msg["event"])
                     continue
@@ -253,14 +266,24 @@ class RpcClient:
                     future.set_exception(RpcError("unavailable", "connection to the fabric closed"))
             await self._events.put(None)
 
+    @property
+    def closed(self) -> bool:
+        return self._task.done()
+
     async def call(self, name: str, **params: Any) -> Any:
+        if self.closed:
+            raise RpcError("unavailable", "connection to the fabric closed")
         mid = self._next
         self._next += 1
         future = asyncio.get_running_loop().create_future()
         self._pending[mid] = future
-        self.writer.write(_encode({"id": mid, "method": name,
-                                   "params": {k: v for k, v in params.items() if v is not None}}))
-        await self.writer.drain()
+        try:
+            self.writer.write(_encode({"id": mid, "method": name,
+                                       "params": {k: v for k, v in params.items() if v is not None}}))
+            await self.writer.drain()
+        except (ConnectionError, RuntimeError, OSError):
+            self._pending.pop(mid, None)
+            raise RpcError("unavailable", "connection to the fabric closed") from None
         return await future
 
     async def subscribe(self) -> None:

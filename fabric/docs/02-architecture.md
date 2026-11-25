@@ -188,13 +188,15 @@ The HA adapter speaks HA's WebSocket API: auth handshake, `get_config` (unit sys
 
 Give the fabric a dedicated HA user and token, and do not also give agents HA's own MCP server (see the prior art).
 
+The token goes in the clear only to this machine: `url` defaults to the HA on the node (`ws://127.0.0.1:8123/api/websocket`), and any other host needs `wss://`. `allow_plaintext = true` lifts that for a network you trust; without it the fabric refuses to start.
+
 ### Matter
 
 The Matter adapter speaks the OHF Matter Server WebSocket API (`ws://127.0.0.1:5580/ws`), the protocol shared by the archived python-matter-server and its matter.js successor. Each endpoint with a supported server cluster becomes `matter:<node>/<endpoint>`. Units are converted: 0.01 °C temperatures and setpoints, levels 0–254, mireds to kelvin, Window Covering lift percent inverted (Matter's 0 is open), milliwatts and milliwatt-hours. Door Lock commands are sent as timed invokes, as the spec requires.
 
 ### One path per device
 
-If HA uses the same Matter Server, every Matter device would appear twice (`ha:light.x` and `matter:5/1`), and a lease or human hold on one id would not cover its alias. The node config sets `exclude_integrations = ["matter"]` on the HA adapter so Matter devices come only through the Matter adapter.
+If HA uses the same Matter Server, every Matter device would appear twice (`ha:light.x` and `matter:5/1`), and a lease or human hold on one id would not cover its alias. The node config sets `exclude_integrations = ["matter"]` on the HA adapter so Matter devices come only through the Matter adapter. Only HA's entity registry says which integration an entity belongs to, so with exclusions set the HA adapter stays unavailable while it cannot read the registry (a non-admin token, say), and an entity that appears after startup is looked up there before it is admitted.
 
 ## Threat model
 

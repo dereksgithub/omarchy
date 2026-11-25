@@ -25,6 +25,10 @@ def build_adapters(configs: "list[AdapterConfig]") -> list[Adapter]:
             raise ValueError(f"unknown adapter type {cfg.type!r} (known: {', '.join(ADAPTERS)})")
         module_name, cls_name = ADAPTERS[cfg.type]
         cls = getattr(importlib.import_module(module_name), cls_name)
+        unknown = sorted(set(cfg.options) - cls.OPTIONS)
+        if unknown:  # a misspelt exclude_integrations would quietly expose every device twice
+            raise ValueError(f"adapter {cfg.id!r} ({cfg.type}): unknown option(s) {', '.join(unknown)} "
+                             f"(allowed: {', '.join(sorted(cls.OPTIONS))})")
         adapters.append(cls(cfg.id, cfg.options))
     return adapters
 

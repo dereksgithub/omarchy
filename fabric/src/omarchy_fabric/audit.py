@@ -6,6 +6,15 @@ the hash of the previous line, so editing or deleting a record breaks the chain
 from that point on (`ofab audit verify`). With an HMAC key (kept where agents
 cannot read it, e.g. on the Pi node) a rewrite of the whole file is detectable
 too.
+
+What a chain cannot show by itself is its own end: cutting records off the tail,
+or putting back an older copy of the file, leaves a chain that still verifies.
+That takes a witness. Every console remembers the newest (seq, hash) it has seen
+and asks `witness()` whether the log still contains it.
+
+A power cut can leave half a line at the end of the file. On start that fragment
+is moved to a `.torn` file next to the log and noted in a `recovered` record,
+instead of stopping the daemon.
 """
 
 from __future__ import annotations
@@ -58,11 +67,16 @@ class AuditLog:
         self.seq = 0
         self.prev = GENESIS
         if self.path and self.path.exists():
+            torn = 0
+            while moved := _recover_tail(self.path):  # one unfinished or unreadable line at a time
+                torn += moved
             last = _last_line(self.path)
             if last:
                 record = json.loads(last)
                 self.seq = int(record["seq"])
                 self.prev = record["hash"]
+            if torn:
+                self.append("recovered", torn_bytes=torn, kept=f"{self.path.name}.torn")
 
     def append(self, kind: str, **fields: Any) -> dict[str, Any]:
         self.seq += 1
@@ -95,6 +109,35 @@ class AuditLog:
             return verify_records(self._memory, self.key, partial=True)
         return verify_file(self.path, self.key)
 
+    def witness(self, seq: int, head: str) -> dict[str, Any]:
+        """Check the log against a (seq, hash) a console saw earlier. A log that is now
+        shorter was cut or rolled back; one that holds a different record at that seq
+        was rewritten."""
+        if seq <= 0:
+            return {"ok": True, "status": "nothing_witnessed", "seq": self.seq}
+        if seq > self.seq:
+            return {"ok": False, "status": "rolled_back", "seq": self.seq, "witnessed_seq": seq,
+                    "message": f"the log ends at record {self.seq}, but record {seq} was seen before"}
+        found = None
+        if self.path and self.path.exists():
+            with open(self.path, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if record.get("seq") == seq:
+                        found = record.get("hash")
+                        break
+        else:
+            found = next((r["hash"] for r in self._memory if r["seq"] == seq), None)
+            if found is None:  # older than what is kept in memory: nothing to compare against
+                return {"ok": True, "status": "not_kept", "seq": self.seq}
+        if found != head:
+            return {"ok": False, "status": "rewritten", "seq": self.seq, "witnessed_seq": seq,
+                    "message": f"record {seq} is not the record that was seen before"}
+        return {"ok": True, "status": "match", "seq": self.seq}
+
 
 def verify_records(records: list[dict[str, Any]], key: bytes | None, partial: bool = False) -> VerifyResult:
     prev = records[0]["prev"] if (partial and records) else GENESIS
@@ -124,6 +167,36 @@ def verify_file(path: Path, key: bytes | None = None) -> VerifyResult:
             except json.JSONDecodeError:
                 return VerifyResult(False, len(records), len(records) + 1, f"line {n} is not valid JSON")
     return verify_records(records, key)
+
+
+def _recover_tail(path: Path) -> int:
+    """Cut an unfinished last line (a write interrupted by a power cut) off the log
+    and keep it in `<log>.torn`. Returns how many bytes were moved."""
+    size = path.stat().st_size
+    if size == 0:
+        return 0
+    with open(path, "rb") as fh:
+        fh.seek(max(0, size - 65536))
+        tail = fh.read()
+    cut = tail.rfind(b"\n") + 1  # everything after the last newline is unfinished
+    fragment = tail[cut:]
+    if not fragment:
+        try:  # ends with a newline: still make sure the last full line is a record
+            json.loads(tail.splitlines()[-1])
+            return 0
+        except (json.JSONDecodeError, IndexError, UnicodeDecodeError):
+            lines = tail.splitlines(keepends=True)
+            fragment = lines[-1] if lines else b""
+            cut = len(tail) - len(fragment)
+    if len(fragment) == len(tail) and size > len(tail):
+        raise ValueError(f"{path}: the last 64 KiB hold no complete record; refusing to guess")
+    with open(path.with_name(path.name + ".torn"), "ab") as torn:
+        torn.write(fragment + (b"" if fragment.endswith(b"\n") else b"\n"))
+    with open(path, "r+b") as fh:
+        fh.truncate(size - len(fragment))
+        fh.flush()
+        os.fsync(fh.fileno())
+    return len(fragment)
 
 
 def _last_line(path: Path) -> str:

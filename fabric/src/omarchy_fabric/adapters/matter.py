@@ -42,6 +42,20 @@ LOCK_STATES = {0: "not_fully_locked", 1: "locked", 2: "unlocked", 3: "open"}
 SYSTEM_MODES = {0: "off", 1: "auto", 3: "cool", 4: "heat", 5: "heat", 6: "cool", 7: "fan_only", 8: "dry"}
 MODE_TO_SYSTEM = {"off": 0, "auto": 1, "heat_cool": 1, "cool": 3, "heat": 4, "fan_only": 7, "dry": 8}
 BACKOFF_S = (1, 2, 5, 10, 30, 60)
+# Which fabric attributes each Matter attribute feeds (see endpoint_state). An update
+# refreshes only those: re-sending the whole endpoint would make a reading that has
+# stopped arriving look fresh whenever anything else on the endpoint changed.
+SOURCES: dict[tuple[int, int], tuple[str, ...]] = {
+    (ON_OFF, 0): ("on",), (LEVEL, 0): ("level",),
+    (COLOR, 7): ("color_temp_kelvin",), (COLOR, 0): ("rgb",), (COLOR, 1): ("rgb",),
+    (DOOR_LOCK, 0): ("lock_state",),
+    (WINDOW_COVERING, 14): ("position", "cover_state"), (WINDOW_COVERING, 10): ("cover_state",),
+    (THERMOSTAT, 0): ("current_temperature",), (THERMOSTAT, 17): ("target_temperature",),
+    (THERMOSTAT, 18): ("target_temperature",), (THERMOSTAT, 28): ("mode", "target_temperature"),
+    (TEMPERATURE, 0): ("temperature",), (HUMIDITY, 0): ("humidity",), (OCCUPANCY, 0): ("occupied",),
+    (BOOLEAN_STATE, 0): ("open", "leak"), (POWER, 8): ("power_w",), (ENERGY, 1): ("energy_kwh",),
+    (VALVE, 4): ("open",),
+}
 
 
 def _field(value: Any, tag: str, name: str) -> Any:
@@ -172,6 +186,7 @@ def endpoint_state(clusters: dict[int, dict[int, Any]], caps: list[str]) -> dict
 
 class MatterAdapter(Adapter):
     type = "matter"
+    OPTIONS = frozenset({"url"})
 
     def __init__(self, adapter_id: str, options: dict[str, Any] | None = None):
         super().__init__(adapter_id, options)
@@ -200,6 +215,9 @@ class MatterAdapter(Adapter):
             try:
                 await self._session()
                 attempt = 0
+                # A clean close ends the session without an error; say so at once
+                # instead of leaving things "online" until the next attempt fails.
+                self.fabric.adapter_status(self.id, False, "connection closed")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -310,12 +328,20 @@ class MatterAdapter(Adapter):
             if node is None:
                 return
             node.setdefault("attributes", {})[path] = value
-            ep = int(path.split("/")[0])
-            clusters = parse_attributes(node["attributes"]).get(ep, {})
+            try:
+                ep, cluster, attr = (int(x) for x in path.split("/"))
+            except ValueError:
+                return
             thing_id = self.thing_id(f"{node_id}/{ep}")
             thing = self.fabric.registry.get(thing_id)
-            if thing is not None:
-                self.fabric.update_state(thing_id, endpoint_state(clusters, list(thing.capabilities)))
+            fed = SOURCES.get((cluster, attr), ())
+            if thing is None or not fed:
+                return
+            clusters = parse_attributes(node["attributes"]).get(ep, {})
+            state = endpoint_state(clusters, list(thing.capabilities))
+            reported = {name: state[name] for name in fed if name in state}
+            if reported:
+                self.fabric.update_state(thing_id, reported)
         elif event == "server_shutdown":
             self.fabric.adapter_status(self.id, False, "Matter server shut down")
 

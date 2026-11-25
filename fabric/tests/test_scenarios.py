@@ -16,7 +16,7 @@ DESKTOP = Assurance.DESKTOP
 
 async def test_S01_observe_without_side_effects(home):
     things = home.fabric.list_things()
-    assert things["count"] == 15
+    assert things["count"] == 16
     assert {"sim:hallway.motion", "sim:entrance.front_door"} <= {t["id"] for t in things["things"]}
     state = home.fabric.get_state("sim:living_room.climate")
     assert state["attributes"]["temperature"]["unit"] == "°C"
@@ -195,7 +195,7 @@ async def test_S18_simulate_is_a_true_dry_run(home):
 async def test_S19_agent_scopes_and_tier_ceilings(home):
     too_risky = await home.do("intern", "kitchen.kettle", "turn_on")
     assert too_risky["code"] == "tier_exceeds_agent"
-    out_of_scope = await home.do("intern", "entrance.front_door", "lock")
+    out_of_scope = await home.do("painter", "office.blinds", "close")  # it may look, but only touch lights
     assert out_of_scope["code"] == "not_permitted"
     assert (await home.do("intern", "office.blinds", "close"))["status"] == "executed"
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from . import catalog
@@ -18,6 +19,16 @@ from .model import (
 from .util import Clock
 
 Listener = Callable[[dict], None]
+
+
+@dataclass
+class _Expected:
+    deadline: float
+    target: Any  # predicted value, or None for a side effect
+    start: Any  # value before the command
+    origin: str  # ORIGIN_FABRIC, or ORIGIN_HUMAN when a person acted through the fabric
+    by: str  # principal id, so a rule can tell its own changes apart
+    allowed: set | None = None  # values a side effect may take; None = any
 
 
 def _same(a: Any, b: Any) -> bool:
@@ -37,8 +48,8 @@ class Registry:
         self.online: dict[str, bool] = {}
         self.events: deque[dict] = deque(maxlen=history)
         self.listeners: list[Listener] = []
-        # (thing, attr) -> (deadline, predicted value, value before the command)
-        self._fabric_window: dict[tuple[str, str], tuple[float, Any, Any]] = {}
+        # (thing, attr) -> what a command the fabric just executed is expected to change
+        self._fabric_window: dict[tuple[str, str], _Expected] = {}
         self.last_human_change: dict[str, tuple[float, str, str]] = {}  # thing -> (ts, attr, origin)
         self._changed = asyncio.Event() if _has_loop() else None
         self._seq = 0
@@ -88,9 +99,12 @@ class Registry:
             current = self.state[thing.id].get(attr)
             if current is None or not _same(current.value, value):
                 self.state[thing.id][attr] = AttrValue(value, now, ORIGIN_INITIAL)
+        was_online = self.online.get(thing.id)
         self.online[thing.id] = online
         if new:
             self.emit({"type": "thing_added", "thing": thing.id})
+        elif was_online != online:  # a backend came back: consoles redraw on this event
+            self.emit({"type": "availability", "thing": thing.id, "online": online})
 
     def remove(self, thing_id: str) -> None:
         if self.things.pop(thing_id, None) is not None:
@@ -111,35 +125,46 @@ class Registry:
         return {k: v.value for k, v in self.state.get(thing_id, {}).items()}
 
     def expect(self, thing_id: str, attrs: set[str], window_s: float,
-               predicted: dict[str, Any] | None = None) -> None:
-        """Record what a fabric command is expected to change. During the window, a
-        change counts as the fabric's only if it reaches the predicted value or moves
-        toward it; anything else (the person who flips the light straight back off)
-        is external, so human hold still protects them."""
+               predicted: dict[str, Any] | None = None, *, origin: str = ORIGIN_FABRIC, by: str = "",
+               allowed: dict[str, set] | None = None) -> None:
+        """Record what a command the fabric executes is expected to change. During the
+        window, a change counts as that command's only if it reaches the predicted
+        value or moves toward it; anything else (the person who flips the light
+        straight back off) is external, so human hold still protects them.
+
+        `origin` is who the command was for: "fabric" for an agent or a rule, "human"
+        when a person acted through the fabric, whose change agents then yield to.
+        `allowed` lists the values an unpredicted side effect may take."""
         deadline = self.clock.now() + window_s
         values = self.values(thing_id)
         predicted = predicted or {}
         for attr in attrs:
-            self._fabric_window[(thing_id, attr)] = (deadline, predicted.get(attr), values.get(attr))
+            self._fabric_window[(thing_id, attr)] = _Expected(
+                deadline, predicted.get(attr), values.get(attr), origin, by, (allowed or {}).get(attr))
 
-    def _attribute(self, thing_id: str, attr: str, value: Any, now: float) -> bool:
+    def _expected(self, thing_id: str, attr: str, now: float) -> "_Expected | None":
         entry = self._fabric_window.get((thing_id, attr))
-        if not entry:
-            return False
-        deadline, target, start = entry
-        if now > deadline:
+        if entry is not None and now > entry.deadline:
             del self._fabric_window[(thing_id, attr)]
-            return False
-        if target is None:  # affected but not predicted (cover_state, power...): accept
-            return True
+            return None
+        return entry
+
+    def _attribute(self, thing_id: str, attr: str, value: Any, now: float) -> "_Expected | None":
+        """The expectation this change fulfils, or None when it is not the command's doing."""
+        entry = self._expected(thing_id, attr, now)
+        if entry is None:
+            return None
+        target, start = entry.target, entry.start
+        if target is None:  # affected but not predicted (level, power, cover_state...)
+            return entry if entry.allowed is None or value in entry.allowed else None
         if _same(value, target) or (isinstance(target, (int, float)) and isinstance(value, (int, float))
                                     and not isinstance(target, bool) and abs(float(value) - float(target)) <= 1.0):
             del self._fabric_window[(thing_id, attr)]  # reached: later changes are someone else's
-            return True
+            return entry
         numeric = all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (value, target, start))
         if numeric and min(start, target) <= value <= max(start, target):
-            return True  # in transit toward the target (a door opening, a fade)
-        return False
+            return entry  # in transit toward the target (a door opening, a fade)
+        return None
 
     def update(self, thing_id: str, attrs: dict[str, Any], origin: str | None = None) -> list[dict]:
         """Apply attribute updates. `origin` comes from the adapter when it knows
@@ -157,14 +182,22 @@ class Registry:
             if prev is not None and _same(prev.value, value):
                 prev.updated_at = now  # still reporting: refresh freshness, no event
                 continue
-            who = origin
+            who, by = origin, ""
             if who is None:
-                if self._attribute(thing_id, attr, value, now):
-                    who = ORIGIN_FABRIC
+                expected = self._attribute(thing_id, attr, value, now)
+                if expected is not None:
+                    who, by = expected.origin, expected.by
                 elif attr in actuated:
                     who = ORIGIN_EXTERNAL
                 else:
                     who = ORIGIN_DEVICE
+            elif who == ORIGIN_FABRIC:
+                # The backend knows the change is ours (its own context id); the
+                # expectation says on whose behalf, which may be a person's.
+                expected = self._expected(thing_id, attr, now)
+                if expected is not None:
+                    who, by = expected.origin, expected.by
+                    self._attribute(thing_id, attr, value, now)  # retires it once the target is reached
             current[attr] = AttrValue(value, now, who)
             change = {
                 "type": "state",
@@ -174,6 +207,8 @@ class Registry:
                 "new": value,
                 "origin": who,
             }
+            if by:
+                change["by"] = by
             if attr in actuated and who not in (ORIGIN_FABRIC, ORIGIN_DEVICE, ORIGIN_INITIAL):
                 self.last_human_change[thing_id] = (now, attr, who)
             changes.append(change)
