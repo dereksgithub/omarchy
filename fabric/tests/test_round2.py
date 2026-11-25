@@ -497,6 +497,26 @@ async def test_B29_a_request_made_while_the_console_connects_gets_a_card(home, s
         await server.stop()
 
 
+# ---------------------------------------------------------------- B30: console.notify = false means no notifications
+async def test_B30_the_console_honours_notify_false_in_the_config(monkeypatch):
+    from omarchy_fabric.cli import build_parser, cmd_console
+
+    made = {}
+
+    class Started:
+        def __init__(self, *args, **options):
+            made.update(options)
+
+        async def run(self):
+            return None
+
+    monkeypatch.setattr(console_mod, "Console", Started)
+    await cmd_console(build_parser().parse_args(["console"]), parse({"console": {"notify": False}}))
+    assert made["notify"] is False  # only --quiet used to count
+    await cmd_console(build_parser().parse_args(["console"]), parse({}))
+    assert made["notify"] is True
+
+
 def test_agents_never_learn_a_thing_exists_from_a_removed_event(home):
     home.fabric.remove_thing("sim:entrance.alarm")
     assert not any(e.get("thing") == "sim:entrance.alarm" for e in home.fabric.recent_events(viewer="claude"))

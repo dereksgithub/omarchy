@@ -219,7 +219,7 @@ async def cmd_rpc_stdio(args, cfg) -> int:
 async def cmd_console(args, cfg) -> int:
     from .console import Console
 
-    console = Console(_target(args, cfg), cfg.console.status_file, notify=not args.quiet,
+    console = Console(_target(args, cfg), cfg.console.status_file, notify=cfg.console.notify and not args.quiet,
                       notify_executed_from=cfg.console.notify_executed_from,
                       room=lambda: desktop_room(cfg), person=cfg.console.person, source=desktop_source(),
                       witness_file=cfg.state_dir / "witness.json", through_dnd=cfg.console.through_dnd)
