@@ -9,7 +9,9 @@ agents, people and rules ask through invoke(), each as its own kind of principal
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 from . import __version__, catalog
@@ -72,14 +74,16 @@ class Fabric:
         self.rules = RuleEngine(self, config.rules, config.rules_path)
         self.adapters: dict[str, Adapter] = {}
         self.adapter_health: dict[str, dict[str, Any]] = {}
-        self.frozen: dict[str, Any] | None = None
+        # Restored before any adapter starts or any request is taken: a restart, a
+        # crash or a power cut must not lift an emergency stop.
+        self.frozen: dict[str, Any] | None = self._load_stop()
         self._tasks: set[asyncio.Task] = set()
         for adapter in adapters if adapters is not None else build_adapters(config.adapters):
             self.adapters[adapter.id] = adapter
 
     # ================================================================ lifecycle
     async def start(self) -> None:
-        self.audit.append("start", version=__version__, adapters=sorted(self.adapters))
+        self.audit.append("start", version=__version__, adapters=sorted(self.adapters), frozen=self.frozen)
         for adapter in self.adapters.values():
             try:
                 await adapter.start(self)
@@ -631,7 +635,8 @@ class Fabric:
         cap_id, cmd = catalog.resolve_command(thing, f"{approval.capability}.{approval.command}")
         ctx = self._context(who, thing, cap_id, cmd, approval.args,
                             approved=approval.resolved_assurance or Assurance.NONE)
-        ctx.rate_ok = True  # already counted when the request was made
+        if ctx.rate_code != "agent_suspended":  # the rate budget was spent when the request was made;
+            ctx.rate_ok, ctx.rate_code, ctx.rate_retry_s = True, "ok", 0.0  # a suspension since then still holds
         decision = self.policy.evaluate(ctx)
         if decision.effect != Effect.ALLOW:
             self.audit.append("cancelled", approval=approval.id, agent=approval.agent, thing=thing.id,
@@ -729,6 +734,7 @@ class Fabric:
         first = self.frozen is None
         if first:  # a later freeze must not rewrite who stopped it and why
             self.frozen = {"by": by, "reason": reason, "since": self.clock.now()}
+        saved = self._save_stop()  # a repeat retries a save that failed
         cancelled = []
         for approval in self.approvals.pending():
             self.approvals.finish(approval, "cancelled", {"code": "frozen"})
@@ -736,14 +742,67 @@ class Fabric:
         self.audit.append("freeze", by=by, reason=reason, cancelled=cancelled or None, again=None if first else True)
         if first:
             self.registry.emit({"type": "freeze", "by": by, "reason": reason})
-        return {"frozen": True, "cancelled_approvals": cancelled}
+        out: dict[str, Any] = {"frozen": True, "cancelled_approvals": cancelled}
+        if not saved:
+            out["warning"] = "the stop is in force but could not be saved, so a restart would lift it"
+        return out
 
     def thaw(self, by: str) -> dict[str, Any]:
         was = self.frozen
         self.frozen = None
+        saved = self._save_stop()  # if the stop file stays, a restart freezes again: the safe way to fail
         self.audit.append("thaw", by=by)
         self.registry.emit({"type": "thaw", "by": by})
-        return {"frozen": False, "was": was}
+        out: dict[str, Any] = {"frozen": False, "was": was}
+        if not saved:
+            out["warning"] = "thawed for now, but the saved stop could not be removed: a restart freezes again"
+        return out
+
+    def _load_stop(self) -> dict[str, Any] | None:
+        """The stop a previous run left in force. A stop file that cannot be read
+        counts as a stop: the fabric stays frozen until a console thaws it."""
+        path = self.config.stop_path
+        if path is None:
+            return None
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(saved, dict):
+                raise ValueError("not a JSON object")
+            return {"by": clean_text(saved.get("by") or "unknown", 80),
+                    "reason": clean_text(saved.get("reason") or "emergency stop", 200),
+                    "since": float(saved.get("since") or self.clock.now())}
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, TypeError) as exc:
+            log.error("cannot read the saved emergency stop %s: %s; staying frozen", path, exc)
+            return {"by": "fabric", "since": self.clock.now(),
+                    "reason": f"the saved emergency stop could not be read ({clean_text(exc, 120)})"}
+
+    def _save_stop(self) -> bool:
+        path = self.config.stop_path
+        if path is None:
+            return True
+        try:
+            if self.frozen is None:
+                path.unlink(missing_ok=True)
+                return True
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.frozen, fh, ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            folder = os.open(path.parent, os.O_RDONLY)  # make the rename itself survive a power cut
+            try:
+                os.fsync(folder)
+            finally:
+                os.close(folder)
+        except OSError as exc:
+            log.error("cannot save the emergency stop to %s: %s", path, exc)
+            self.audit.append("stop_not_saved", error=clean_text(exc, 200), frozen=self.frozen is not None)
+            return False
+        return True
 
     def acquire_lease(self, agent: str, thing_id: str, ttl_s: float, purpose: str = "") -> dict[str, Any]:
         thing = self._thing(thing_id, viewer=agent)

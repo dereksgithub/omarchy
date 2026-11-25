@@ -1,5 +1,6 @@
 """Round 2: one test per defect the audit found in round 1 (docs/07-audit.md, B-numbers),
-plus the scoping and transport hardening that came with fixing them."""
+plus the scoping and transport hardening that came with fixing them. B25 onwards are
+the automated review's leads on round 1 that round 2 left open (fixed in round 3)."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import json
 import pytest
 
 from omarchy_fabric import console as console_mod
+from omarchy_fabric.adapters import homeassistant as ha_mod
 from omarchy_fabric.api import Session, dispatch
 from omarchy_fabric.approvals import KEEP_FINAL
 from omarchy_fabric.audit import AuditLog, verify_file
@@ -17,8 +19,10 @@ from omarchy_fabric.fabric import Fabric
 from omarchy_fabric.mcp_server import RemoteBackend
 from omarchy_fabric.model import Assurance, InvalidRequest, InvokeRequest, NotFound, PermissionDenied, Thing
 from omarchy_fabric.rpc import RpcClient, RpcError, RpcServer
+from omarchy_fabric.util import FakeClock
 
 from .conftest import BASE, merge
+from .fakes import HA_TOKEN, FakeHomeAssistant, FakeMatterServer
 
 DESKTOP = Assurance.DESKTOP
 DIMMER_PLUG = {"adapters": [{"type": "simulator", "id": "sim", "tick_s": 0, "things": [
@@ -377,6 +381,161 @@ async def test_B24_a_resolved_request_replaces_its_card(omarchy_desktop, monkeyp
     assert any(word.startswith("Expired: ") for word in sent[1])
     await console.handle({"type": "approval_resolved", "approval": {**approval, "status": "expired"}})
     assert len(sent) == 2  # nothing left to replace
+
+
+# ================================================================ B25 - B32: leads from the automated review of round 1
+# ---------------------------------------------------------------- B25: the emergency stop outlives a restart
+async def test_B25_a_restart_does_not_lift_the_emergency_stop(make_home):
+    before = await make_home()
+    before.fabric.freeze("gpio:kill", "physical kill switch")
+    after = await make_home()  # the same state directory: the node came back after a power cut
+    assert after.fabric.frozen["by"] == "gpio:kill" and after.fabric.frozen["reason"] == "physical kill switch"
+    assert (await after.do("claude", "kitchen.kettle", "turn_on"))["code"] == "frozen"
+    after.fabric.thaw("console:desktop")
+    assert (await make_home()).fabric.frozen is None
+    after.fabric.config.stop_path.write_text("{torn")  # a stop file nobody can read still counts as a stop
+    assert (await make_home()).fabric.frozen["by"] == "fabric"
+
+
+# ---------------------------------------------------------------- B26: a suspension covers what is already waiting
+async def test_B26_an_approved_request_of_a_suspended_agent_does_not_run(home):
+    pending = await home.do("claude", "kitchen.kettle", "turn_on", reason="tea")
+    for _ in range(10):  # then it loops on something it may not do, and the breaker trips
+        await home.do("claude", "living_room.thermostat", "set_target_temperature", temperature=30)
+    assert "claude" in home.fabric.status()["suspended_agents"]
+    home.fabric.resolve_approval(pending["approval_id"], True, "console:desktop", DESKTOP)
+    final = await home.fabric.approval_status(pending["approval_id"], wait_s=2)
+    assert final["status"] == "cancelled" and final["approval"]["result"]["code"] == "agent_suspended"
+    assert home.value("kitchen.kettle", "on") is False
+
+
+# ---------------------------------------------------------------- B27: the HA token stays off the wire
+def test_B27_the_ha_token_only_goes_in_plaintext_to_this_machine():
+    def ha(**options):
+        cfg = parse(merge(BASE, {"adapters": [{"type": "homeassistant", "id": "ha", **options}]}))
+        return Fabric(cfg).adapters["ha"]
+
+    assert ha().url == "ws://127.0.0.1:8123/api/websocket"  # was ws://homeassistant.local: across the LAN
+    with pytest.raises(ValueError) as err:
+        ha(url="ws://homeassistant.local:8123/api/websocket")
+    assert "plaintext" in str(err.value) and "allow_plaintext" in str(err.value)
+    assert ha(url="wss://ha.example.net/api/websocket").url.startswith("wss://")
+    assert ha(url="ws://[::1]:8123/api/websocket", token="t")
+    assert ha(url="ws://192.168.1.20:8123/api/websocket", allow_plaintext=True)
+
+
+# ---------------------------------------------------------------- B28: one id per device, or no HA at all
+async def _until(predicate, timeout: float = 3.0) -> bool:
+    for _ in range(int(timeout / 0.02)):
+        if predicate():
+            return True
+        await asyncio.sleep(0.02)
+    return predicate()
+
+
+async def test_B28_ha_stays_unavailable_until_it_can_leave_matter_devices_out(monkeypatch):
+    monkeypatch.setattr(ha_mod, "BACKOFF_S", (0.05,))
+    async with FakeHomeAssistant() as ha:
+        ha.platforms["lock.front_door"] = "matter"  # the Matter adapter has this lock already, as matter:2/1
+        ha.registry_denied = True  # say the fabric's HA user lost its admin rights
+        fabric = Fabric(parse({"audit": {"enabled": False}, "adapters": [
+            {"type": "homeassistant", "id": "ha", "url": ha.url, "token": HA_TOKEN, "exclude_integrations": ["matter"]}]}))
+        await fabric.start()
+        try:
+            assert await _until(lambda: "entity registry" in fabric.adapter_health["ha"]["detail"])
+            assert not fabric.adapter_health["ha"]["connected"] and not fabric.registry.things  # was: all of them
+            ha.registry_denied = False
+            assert await _until(lambda: fabric.adapter_health["ha"]["connected"])
+            assert "ha:lock.front_door" not in fabric.registry.things
+            await ha.add_entity("lock.back_door", "locked", {"friendly_name": "Back door"}, platform="matter")
+            await ha.add_entity("light.porch", "off", {"friendly_name": "Porch", "supported_color_modes": ["onoff"]},
+                                platform="hue")
+            assert await _until(lambda: "ha:light.porch" in fabric.registry.things)
+            assert "ha:lock.back_door" not in fabric.registry.things  # paired after startup, excluded all the same
+        finally:
+            await fabric.stop()
+    with pytest.raises(ValueError):  # a config that turns the registry off cannot exclude anything
+        Fabric(parse({"audit": {"enabled": False}, "adapters": [
+            {"type": "homeassistant", "exclude_integrations": ["matter"], "use_registry": False}]}))
+
+
+# ---------------------------------------------------------------- B29: a console misses nothing while it connects
+async def test_B29_a_request_made_while_the_console_connects_gets_a_card(home, short_tmp, omarchy_desktop,
+                                                                          monkeypatch):
+    monkeypatch.setattr(console_mod.shutil, "which", lambda name: None if name == "dbus-monitor" else f"/usr/bin/{name}")
+    sent = []
+
+    async def fake_run(cmd, fallback="", capture=False):
+        sent.append(cmd)
+        return str(len(sent)) if capture else ""
+
+    monkeypatch.setattr(console_mod, "_run", fake_run)
+    rpc = RpcConfig(socket=short_tmp / "fabric.sock", local_assurance=DESKTOP)
+    server = RpcServer(home.fabric, rpc)
+    await server.start()
+    away = await home.do("claude", "kitchen.kettle", "turn_on", reason="tea")  # asked before the console came up
+    console = console_mod.Console(str(rpc.socket), short_tmp / "status.json")
+    console._waited = True
+    snapshot, meanwhile = console.refresh, {}
+
+    async def refresh():
+        taken = await snapshot()
+        if not meanwhile:  # straight after the console's first look, where it used to subscribe only later
+            meanwhile.update(await home.do("codex", "kitchen.kettle", "turn_on", reason="more tea"))
+        return taken
+
+    console.refresh = refresh
+    task = asyncio.ensure_future(console.run())
+
+    def carded(approval_id: str) -> bool:
+        return any(cmd and cmd[-2:] == ["--with", approval_id] for cmd in sent)
+
+    try:
+        assert await _until(lambda: bool(meanwhile) and carded(meanwhile["approval_id"]))
+        assert carded(away["approval_id"])
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await server.stop()
+
+
+# ---------------------------------------------------------------- B30: console.notify = false means no notifications
+async def test_B30_the_console_honours_notify_false_in_the_config(monkeypatch):
+    from omarchy_fabric.cli import build_parser, cmd_console
+
+    made = {}
+
+    class Started:
+        def __init__(self, *args, **options):
+            made.update(options)
+
+        async def run(self):
+            return None
+
+    monkeypatch.setattr(console_mod, "Console", Started)
+    await cmd_console(build_parser().parse_args(["console"]), parse({"console": {"notify": False}}))
+    assert made["notify"] is False  # only --quiet used to count
+    await cmd_console(build_parser().parse_args(["console"]), parse({}))
+    assert made["notify"] is True
+
+
+# ---------------------------------------------------------------- B32: a Matter reading ages unless it is reported
+async def test_B32_a_matter_update_refreshes_only_what_it_reports():
+    clock = FakeClock()
+    async with FakeMatterServer() as server:
+        fabric = Fabric(parse({"audit": {"enabled": False}, "adapters": [{"type": "matter", "url": server.url}]}),
+                        clock=clock)
+        await fabric.start()
+        try:
+            assert await _until(lambda: fabric.adapter_health["matter"]["connected"])
+            clock.advance(1000)  # the thermostat's sensor has gone quiet for longer than stale_after_s
+            await server.set_attribute(4, "1/513/18", 2100)  # someone changes the heating setpoint
+            assert await _until(lambda: fabric.registry.values("matter:4/1").get("target_temperature") == 21.0)
+            attrs = fabric.get_state("matter:4/1")["attributes"]
+            assert attrs["current_temperature"].get("stale") is True  # was refreshed along with the setpoint
+            assert attrs["target_temperature"]["age_s"] == 0
+        finally:
+            await fabric.stop()
 
 
 def test_agents_never_learn_a_thing_exists_from_a_removed_event(home):

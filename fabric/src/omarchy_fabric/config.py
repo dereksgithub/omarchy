@@ -92,6 +92,7 @@ class FabricConfig:
     source: Path | None = None
     rules: list[Rule] = field(default_factory=list)  # [[rules]]: the deterministic fast path
     rules_path: Path | None = None  # where rules added at runtime are kept
+    stop_path: Path | None = None  # where an emergency stop is kept, so a restart does not lift it
     default_person: str | None = None  # who "the user" is when nobody is named
 
     def apply_thing_overrides(self, thing: Thing) -> Thing:
@@ -208,6 +209,7 @@ def parse(data: dict[str, Any], source: Path | None = None) -> FabricConfig:
     )
     rules_file = fab.get("rules_file", "rules.json")
     cfg.rules_path = expand(rules_file, state_dir) if rules_file else None
+    cfg.stop_path = state_dir / "emergency-stop.json"
 
     audit = _only(data.get("audit", {}), _AUDIT, "[audit]")
     if audit.get("enabled", True):
