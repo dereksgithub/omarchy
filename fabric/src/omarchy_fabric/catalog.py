@@ -148,9 +148,30 @@ CAPABILITIES: dict[str, C] = {
               A("energy_kwh", "number", unit="kWh", measurement=True, matter="0x0091/0x0001"),
           )),
         C("button", "Button", 0x003B,
+          description="A button, switch or doorbell. Presses arrive as gesture events "
+                      "(single, double, long, ...), which rules can bind to actions.",
           attributes=(A("pressed", "boolean", measurement=True, matter="0x003B/0x0001"),)),
     )
 }
+
+# Gestures. Backends name presses differently (Home Assistant event types, Zigbee2MQTT
+# actions, Matter Generic Switch events); rules match on these canonical names, and a
+# name we do not know passes through cleaned so a rule can still match it literally.
+_GESTURES = {
+    "single": ("single", "single_press", "press", "pressed", "click", "short_press", "short_release",
+               "multi_press_1", "1_single", "on_press"),
+    "double": ("double", "double_press", "double_click", "multi_press_2", "1_double"),
+    "triple": ("triple", "triple_press", "triple_click", "multi_press_3"),
+    "long": ("long", "long_press", "hold", "held", "1_long"),
+    "release": ("release", "long_release", "1_long_release"),
+    "ring": ("ring", "ding", "doorbell"),
+}
+_GESTURE_ALIASES = {alias: name for name, aliases in _GESTURES.items() for alias in aliases}
+
+
+def canonical_gesture(name: object) -> str:
+    text = "".join(ch if ch.isalnum() else "_" for ch in str(name).strip().lower()).strip("_")[:32]
+    return _GESTURE_ALIASES.get(text, text or "single")
 
 
 # Profiles: a thing's *kind* adjusts tiers (and whether a command counts as safer).
@@ -178,6 +199,8 @@ PROFILES: dict[str, dict[str, tuple[Tier, bool | None]]] = {
     "lock": {},
     "thermostat": {},
     "sensor": {},
+    "button": {},
+    "doorbell": {},
 }
 
 
@@ -234,6 +257,44 @@ def effective_profile(thing: Thing, cap_id: str, cmd: Cmd) -> tuple[Tier, bool]:
     elif cmd.name in thing.tier_overrides:
         tier = thing.tier_overrides[cmd.name]
     return tier, safer
+
+
+# Commands on other capabilities that also switch the device. Dimming a plug to 40 %
+# turns it on, so it must not be cheaper than turn_on on the same thing.
+_SWITCHES_ON = {("level", "set_level"), ("color", "set_color"), ("color", "set_color_temp")}
+
+
+def effective_tier(thing: Thing, cap_id: str, cmd: Cmd, args: dict | None = None) -> tuple[Tier, bool]:
+    """effective_profile plus what the command implies. A command that also turns the
+    thing on (or off, for set_level 0) takes at least the tier of that on_off command.
+    With no arguments yet (describe) the riskier direction counts."""
+    tier, safer = effective_profile(thing, cap_id, cmd)
+    if (cap_id, cmd.name) not in _SWITCHES_ON or "on_off" not in thing.capabilities:
+        return tier, safer
+    switch = capability("on_off")
+    on_tier, _ = effective_profile(thing, "on_off", switch.command("turn_on"))
+    if cmd.name != "set_level":
+        return max(tier, on_tier), safer
+    off_tier, off_safer = effective_profile(thing, "on_off", switch.command("turn_off"))
+    level = (args or {}).get("level")
+    if isinstance(level, bool) or not isinstance(level, (int, float)):
+        return max(tier, on_tier, off_tier), False
+    if level > 0:
+        return max(tier, on_tier), False
+    return max(tier, off_tier), off_safer
+
+
+def default_tier(command: str) -> Tier:
+    """The riskiest catalog default for a command name, for things that do not exist yet."""
+    cap_id, _, name = command.rpartition(".")
+    tiers = [c.tier for spec in CAPABILITIES.values() if not cap_id or spec.id == cap_id
+             for c in spec.commands if c.name == name]
+    return max(tiers) if tiers else Tier.T3
+
+
+def knows_command(command: str) -> bool:
+    cap_id, _, name = command.rpartition(".")
+    return any(spec.command(name) for spec in CAPABILITIES.values() if not cap_id or spec.id == cap_id)
 
 
 def actuated_attributes(thing: Thing) -> set[str]:
@@ -293,3 +354,18 @@ def affected_attributes(cmd: Cmd) -> set[str]:
     if cmd.name in ("lock", "unlock"):
         attrs.add("lock_state")
     return attrs
+
+
+# Side-effect values that fit a command. A cover that reports "stopped" or starts
+# closing while the fabric is opening it was not moved by the fabric: someone hit the
+# wall button, and that person must get their human hold.
+_COVER_STATES = {
+    "open": {"opening", "open"},
+    "close": {"closing", "closed"},
+    "stop": {"stopped", "open", "closed"},
+}
+
+
+def allowed_side_effects(cmd: Cmd) -> dict[str, set]:
+    states = _COVER_STATES.get(cmd.name)
+    return {"cover_state": states} if states and "position" in affected_attributes(cmd) else {}

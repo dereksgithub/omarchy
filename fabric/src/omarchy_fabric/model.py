@@ -61,7 +61,10 @@ class Assurance(enum.IntEnum):
             return value
         if isinstance(value, int):
             return cls(value)
-        return cls[str(value).strip().upper()]
+        try:
+            return cls[str(value).strip().upper()]
+        except KeyError:
+            raise ValueError(f"unknown assurance {value!r} (none, cli, desktop or presence)") from None
 
     def __str__(self) -> str:
         return self.name.lower()
@@ -75,6 +78,40 @@ ORIGIN_EXTERNAL = "external"  # unexplained change: wall switch, other controlle
 ORIGIN_AUTOMATION = "automation"  # an HA automation / script
 ORIGIN_DEVICE = "device"  # device-internal (sensor reading, auto-off timer)
 ORIGIN_INITIAL = "initial"  # snapshot taken when the thing was discovered
+
+
+KIND_AGENT = "agent"
+KIND_HUMAN = "human"
+KIND_RULE = "rule"
+
+
+@dataclass(frozen=True)
+class Principal:
+    """Who is asking. Policy treats the three kinds differently.
+
+    agent  an AI agent behind MCP or the RPC: every guard applies.
+    human  a person acting through a channel the fabric trusts (a console, a wall
+           terminal, a gesture bound to them). The guards that exist to hold agents
+           back (scope, tier ceiling, human hold, leases, rate limits, quiet hours,
+           freeze) do not apply, and the channel's own assurance counts toward the
+           approval a tier needs: a desktop session runs T2 itself, T3 still waits
+           for the button.
+    rule   a deterministic rule. A person wrote or approved it once, with a tier
+           ceiling; up to that ceiling it needs no approval per action, and it
+           still yields to people, to leases and to the emergency stop.
+    """
+
+    kind: str
+    name: str
+    assurance: Assurance = Assurance.NONE  # human: what the channel proves
+    max_tier: Tier | None = None  # rule: the ceiling it was approved with
+    author: str | None = None  # rule: the agent that proposed it; its scope still applies
+
+    @property
+    def id(self) -> str:
+        """Agents keep their bare name ("claude-code"); the others are prefixed
+        ("human:desktop", "rule:leak-shutoff"). Names cannot contain ":"."""
+        return self.name if self.kind == KIND_AGENT else f"{self.kind}:{self.name}"
 
 
 @dataclass(frozen=True)
@@ -233,6 +270,14 @@ class InvokeRequest:
     reason: str = ""
     dry_run: bool = False
     wait_s: float = 0.0
+    principal: Principal | None = None  # defaults to the agent named above
+    cause: str = ""  # what set it off (a rule's trigger), for the audit log
+
+    def __post_init__(self) -> None:
+        if self.principal is None:
+            self.principal = Principal(KIND_AGENT, self.agent)
+        else:
+            self.agent = self.principal.id
 
     def to_dict(self) -> dict[str, Any]:
         return {

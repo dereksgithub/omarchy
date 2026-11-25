@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from omarchy_fabric import config as config_mod
 from omarchy_fabric.config import parse
 from omarchy_fabric.fabric import Fabric
 from omarchy_fabric.model import InvokeRequest
@@ -29,7 +30,8 @@ BASE: dict[str, Any] = {
     "agents": {
         "claude": {"max_tier": "T3"},
         "codex": {"max_tier": "T3"},
-        "intern": {"max_tier": "T1", "deny": ["area:entrance"]},
+        "intern": {"max_tier": "T1", "deny": ["area:entrance"]},  # the entrance is hidden from it
+        "painter": {"max_tier": "T1", "things": ["kind:light"], "presence": False},  # sees all, controls lights
         "*": {"max_tier": "T1"},
     },
 }
@@ -57,6 +59,13 @@ class Home:
 
     def value(self, thing: str, attr: str) -> Any:
         return self.fabric.registry.values(f"sim:{thing}").get(attr)
+
+
+@pytest.fixture(autouse=True)
+def _own_state_dir(tmp_path_factory, monkeypatch):
+    """No test reads or writes the developer's real ~/.local/state/omarchy-fabric
+    (stored rules, the audit log): every config without a state_dir lands here."""
+    monkeypatch.setattr(config_mod, "DEFAULT_STATE", tmp_path_factory.mktemp("state"))
 
 
 @pytest.fixture

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from ..model import ORIGIN_AUTOMATION, ORIGIN_FABRIC, ORIGIN_HUMAN, Thing
@@ -23,7 +24,8 @@ from ..util import glob
 from .base import Adapter, AdapterError
 
 DEFAULT_DOMAINS = ("light", "switch", "fan", "lock", "cover", "climate", "sensor", "binary_sensor",
-                   "valve", "alarm_control_panel", "input_boolean")
+                   "valve", "alarm_control_panel", "input_boolean", "event")
+EVENT_FRESH_S = 15.0  # an event entity's state is the time of its last event
 LOCK_STATES = {"locked": "locked", "unlocked": "unlocked", "jammed": "jammed", "locking": "locking",
                "unlocking": "unlocking", "open": "open", "opening": "unlocking"}
 COVER_STATES = ("open", "closed", "opening", "closing")
@@ -125,6 +127,8 @@ def map_entity(state: dict[str, Any], temp_unit: str = "°C") -> tuple[list[str]
         return ["alarm_panel"], None, {"alarm_state": s if s in ALARM_STATES else "unknown"}
     if domain in ("scene", "script"):
         return ["scene"], None, {}
+    if domain == "event":  # buttons, remotes and doorbells: their presses become gestures
+        return ["button"], ("doorbell" if a.get("device_class") == "doorbell" else "button"), {}
     return None
 
 
@@ -171,6 +175,8 @@ def service_for(entity_id: str, capability: str, command: str, args: dict[str, A
 
 class HomeAssistantAdapter(Adapter):
     type = "homeassistant"
+    OPTIONS = frozenset({"url", "token", "token_file", "include_domains", "include_entities", "exclude_entities",
+                         "exclude_integrations", "use_registry", "alarm_code"})
 
     def __init__(self, adapter_id: str, options: dict[str, Any] | None = None):
         super().__init__(adapter_id, options)
@@ -225,6 +231,9 @@ class HomeAssistantAdapter(Adapter):
             try:
                 await self._session()
                 attempt = 0
+                # A clean close ends the session without an error; say so at once
+                # instead of leaving things "online" until the next attempt fails.
+                self.fabric.adapter_status(self.id, False, "connection closed")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -253,10 +262,14 @@ class HomeAssistantAdapter(Adapter):
                 # state_changed event before the call_service result arrives.
                 me = await self._call({"type": "auth/current_user"})
                 self.own_user_id = (me or {}).get("id")
+                shared = bool((me or {}).get("is_owner"))
                 registry = await self._load_registry() if self.use_registry else {}
                 await self._call({"type": "subscribe_events", "event_type": "state_changed"})
                 states = await self._call({"type": "get_states"})
-                self.fabric.adapter_status(self.id, True, f"Home Assistant {self.ha_version}".strip())
+                detail = f"Home Assistant {self.ha_version}".strip()
+                if shared:  # what that person does in the HA app would look like the fabric's doing
+                    detail += " (warning: the token belongs to the owner account; use a dedicated user)"
+                self.fabric.adapter_status(self.id, True, detail)
                 self._sync(states, registry)
                 await reader
             finally:
@@ -393,8 +406,26 @@ class HomeAssistantAdapter(Adapter):
             return
         _, _, attrs = mapped
         self.fabric.set_online(thing_id, new.get("state") != "unavailable")
+        if entity_id.startswith("event."):
+            if self._fresh_event(new, data.get("old_state")):
+                self.fabric.gesture(thing_id, (new.get("attributes") or {}).get("event_type") or "single")
+            return
         origin = self._origin(new.get("context") or event.get("context"))
         self.fabric.update_state(thing_id, {k: v for k, v in attrs.items() if v is not None}, origin)
+
+    def _fresh_event(self, new: dict[str, Any], old: dict[str, Any] | None) -> bool:
+        """An event entity fired just now. Its state is a timestamp that HA also restores
+        after a restart, and that must not replay a button press from yesterday."""
+        stamp = new.get("state")
+        if not stamp or stamp in ("unknown", "unavailable") or (old or {}).get("state") == stamp:
+            return False
+        try:
+            when = datetime.fromisoformat(str(stamp))
+        except ValueError:
+            return False
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return abs(self.fabric.clock.now() - when.timestamp()) <= EVENT_FRESH_S
 
     # ------------------------------------------------------------ execution
     async def execute(self, thing: Thing, capability: str, command: str, args: dict[str, Any]) -> dict[str, Any]:

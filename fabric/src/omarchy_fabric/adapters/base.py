@@ -24,6 +24,7 @@ class Adapter(abc.ABC):
     """
 
     type: ClassVar[str] = "base"
+    OPTIONS: ClassVar[frozenset[str]] = frozenset()  # config keys this adapter understands
 
     def __init__(self, adapter_id: str, options: dict[str, Any] | None = None):
         self.id = adapter_id

@@ -2,6 +2,10 @@
 
 See examples/*.toml. Without a config file the fabric runs the built-in
 simulator with a development policy, so `ofab serve` works out of the box.
+
+Unknown keys are errors. This file decides what agents may do to a home, and a
+misspelt `[[policy.bound]]` that quietly meant "no bounds" is the worst kind of
+typo to forgive.
 """
 
 from __future__ import annotations
@@ -14,9 +18,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import catalog
 from .model import Assurance, Effect, Thing, Tier
-from .policy import AgentPolicy, Bound, PolicyConfig, QuietHours, Rule
-from .util import match_thing, parse_hhmm
+from .policy import AgentPolicy, Bound, Override, PolicyConfig, QuietHours
+from .rules import Rule, parse_rule
+from .util import match_thing, parse_hhmm, slug, valid_name
 
 DEFAULT_CONFIG = Path("~/.config/omarchy-fabric/config.toml")
 DEFAULT_STATE = Path("~/.local/state/omarchy-fabric")
@@ -61,6 +67,9 @@ class ConsoleConfig:
     connect: str | None = None  # where clients find the fabric: unix path, ssh://fabric@pi5, tcp://host:port
     notify: bool = True
     notify_executed_from: Tier = Tier.T2  # tell the human about executed actions at or above this tier
+    room: str | None = None  # the room this desktop is in: while someone is at it, they are there
+    through_dnd: bool = True  # requests waiting for you, and alarms, get through Do Not Disturb
+    person: str | None = None  # who that someone is (default: presence.default_person)
 
 
 @dataclass
@@ -81,6 +90,9 @@ class FabricConfig:
     confirm_timeout_s: float = 2.0
     fabric_window_s: float = 15.0
     source: Path | None = None
+    rules: list[Rule] = field(default_factory=list)  # [[rules]]: the deterministic fast path
+    rules_path: Path | None = None  # where rules added at runtime are kept
+    default_person: str | None = None  # who "the user" is when nobody is named
 
     def apply_thing_overrides(self, thing: Thing) -> Thing:
         """Glob keys apply first, exact ids last (most specific wins)."""
@@ -143,9 +155,46 @@ def _tiers(table: dict[str, Any]) -> dict[str, Tier]:
     return {str(k): Tier.parse(v) for k, v in table.items()}
 
 
+def _only(table: Any, allowed: set[str], where: str) -> dict[str, Any]:
+    if not isinstance(table, dict):
+        raise ValueError(f"{where} must be a table")
+    unknown = sorted(set(table) - allowed)
+    if unknown:
+        raise ValueError(f"{where}: unknown key(s) {', '.join(unknown)} (allowed: {', '.join(sorted(allowed))})")
+    return table
+
+
+_TOP = {"fabric", "audit", "adapters", "things", "policy", "agents", "rpc", "console", "rules", "presence"}
+_FABRIC = {"name", "state_dir", "stale_after_s", "execute_timeout_s", "confirm_timeout_s", "fabric_window_s",
+           "event_history", "rules_file"}
+_AUDIT = {"enabled", "path", "hmac_key_file", "fsync"}
+_THING = {"name", "area", "kind", "expose", "tags", "tiers"}
+_POLICY = {"tiers", "assurance", "approval_timeout_s", "human_hold_s", "suspend_s", "lease_max_s",
+           "allow_safer_when_frozen", "allow_safer_during_hold", "human_hold_origins", "rate", "quiet_hours",
+           "bounds", "rules", "rules_max_tier", "swap_guard_s"}
+_RATE = {"per_agent_per_minute", "per_thing_per_minute", "suspend_after_denials_per_minute"}
+_QUIET = {"start", "end", "escalate_from"}
+_BOUND = {"param", "min", "max", "thing", "capability", "note"}
+_OVERRIDE = {"effect", "agent", "thing", "capability", "command", "min_tier", "assurance", "note"}
+_AGENT = {"max_tier", "things", "deny", "observe", "presence"}
+_RPC = {"socket", "tcp", "tokens", "local_assurance"}
+_TOKEN = {"role", "agent", "token", "token_file", "max_assurance"}
+_CONSOLE = {"status_file", "connect", "notify", "notify_executed_from", "room", "person", "through_dnd"}
+_PRESENCE = {"default_person"}
+
+
+def _person(value: Any, where: str) -> str | None:
+    if value in (None, ""):
+        return None
+    if not valid_name(value):
+        raise ValueError(f"{where} must be a short name: letters, digits, '.', '_' or '-'")
+    return value
+
+
 def parse(data: dict[str, Any], source: Path | None = None) -> FabricConfig:
+    _only(data, _TOP, "config")
     base = source.parent if source else None
-    fab = data.get("fabric", {})
+    fab = _only(data.get("fabric", {}), _FABRIC, "[fabric]")
     state_dir = expand(fab.get("state_dir", DEFAULT_STATE), base)
     cfg = FabricConfig(
         name=fab.get("name", "home"),
@@ -157,8 +206,10 @@ def parse(data: dict[str, Any], source: Path | None = None) -> FabricConfig:
         event_history=int(fab.get("event_history", 500)),
         source=source,
     )
+    rules_file = fab.get("rules_file", "rules.json")
+    cfg.rules_path = expand(rules_file, state_dir) if rules_file else None
 
-    audit = data.get("audit", {})
+    audit = _only(data.get("audit", {}), _AUDIT, "[audit]")
     if audit.get("enabled", True):
         cfg.audit_path = expand(audit.get("path", "audit.jsonl"), state_dir)
     if audit.get("hmac_key_file"):
@@ -169,28 +220,59 @@ def parse(data: dict[str, Any], source: Path | None = None) -> FabricConfig:
         cfg.audit_key = key_path.read_bytes().strip()
     cfg.audit_fsync = bool(audit.get("fsync", True))
 
-    for i, entry in enumerate(data.get("adapters", [])):
+    for entry in data.get("adapters", []):
         entry = dict(entry)
+        if "type" not in entry:
+            raise ValueError("every [[adapters]] entry needs a type")
         kind = entry.pop("type")
-        adapter_id = entry.pop("id", kind if i == 0 else f"{kind}{i}")
+        adapter_id = str(entry.pop("id", kind))
+        if not valid_name(adapter_id):
+            raise ValueError(f"adapter id {adapter_id!r} must be letters, digits, '.', '_' or '-'")
+        if any(a.id == adapter_id for a in cfg.adapters):
+            raise ValueError(f"two adapters share the id {adapter_id!r}; give each [[adapters]] entry its own id")
         cfg.adapters.append(AdapterConfig(kind, adapter_id, entry))
 
-    for thing_id, entry in data.get("things", {}).items():
+    for thing_id, entry in _only(data.get("things", {}), set(data.get("things", {})), "[things]").items():
+        _only(entry, _THING, f"[things.{thing_id!r}]")
+        kind = entry.get("kind")
+        if kind is not None and kind not in catalog.PROFILES:
+            # An unknown kind would fall back to the catalog's defaults, which for a
+            # plug are *less* careful than leaving the kind alone.
+            raise ValueError(f"[things.{thing_id!r}]: unknown kind {kind!r} "
+                             f"(known: {', '.join(sorted(catalog.PROFILES))})")
         cfg.things[thing_id] = ThingConfig(
-            name=entry.get("name"), area=entry.get("area"), kind=entry.get("kind"),
+            name=entry.get("name"), area=entry.get("area"), kind=kind,
             expose=entry.get("expose"), tags=tuple(entry.get("tags", ())), tiers=_tiers(entry.get("tiers", {})),
         )
 
     cfg.policy = parse_policy(data.get("policy", {}), data.get("agents", {}))
 
-    rpc = data.get("rpc", {})
+    presence = _only(data.get("presence", {}), _PRESENCE, "[presence]")
+    cfg.default_person = _person(presence.get("default_person"), "presence.default_person")
+
+    for entry in data.get("rules", []):
+        rule = parse_rule(entry)
+        if any(r.id == rule.id for r in cfg.rules):
+            raise ValueError(f"two rules are named {rule.id!r}")
+        if rule.max_tier > cfg.policy.rules_max_tier:
+            raise ValueError(f"rule {rule.id}: max_tier {rule.max_tier} is above policy.rules_max_tier "
+                             f"({cfg.policy.rules_max_tier}); raise that first if you mean it")
+        cfg.rules.append(rule)
+
+    rpc = _only(data.get("rpc", {}), _RPC, "[rpc]")
     tokens = []
     for entry in rpc.get("tokens", []):
+        _only(entry, _TOKEN, "[[rpc.tokens]]")
         secret = _read_secret(entry, base=base)
         if not secret:
             raise ValueError("every [[rpc.tokens]] entry needs token or token_file")
-        tokens.append(TokenConfig(role=entry.get("role", "agent"), agent=entry.get("agent", "remote"),
-                                  token=secret, max_assurance=Assurance.parse(entry.get("max_assurance", "desktop"))))
+        role, agent = entry.get("role", "agent"), entry.get("agent", "remote")
+        if role not in ("agent", "console", "admin"):
+            raise ValueError(f"[[rpc.tokens]]: unknown role {role!r}")
+        if not valid_name(agent):
+            raise ValueError(f"[[rpc.tokens]]: agent {agent!r} must be letters, digits, '.', '_' or '-'")
+        tokens.append(TokenConfig(role=role, agent=agent, token=secret,
+                                  max_assurance=Assurance.parse(entry.get("max_assurance", "desktop"))))
     cfg.rpc = RpcConfig(
         socket=expand(rpc["socket"], base) if rpc.get("socket") else default_socket(),
         tcp=rpc.get("tcp"),
@@ -198,52 +280,75 @@ def parse(data: dict[str, Any], source: Path | None = None) -> FabricConfig:
         local_assurance=Assurance.parse(rpc.get("local_assurance", "desktop")),
     )
 
-    console = data.get("console", {})
+    console = _only(data.get("console", {}), _CONSOLE, "[console]")
     cfg.console = ConsoleConfig(
         status_file=expand(console.get("status_file", "omarchy-fabric/status.json"), runtime_dir()),
         connect=console.get("connect"),
         notify=bool(console.get("notify", True)),
         notify_executed_from=Tier.parse(console.get("notify_executed_from", "T2")),
+        room=slug(console["room"]) if console.get("room") else None,
+        through_dnd=bool(console.get("through_dnd", True)),
+        person=_person(console.get("person"), "console.person"),
     )
     return cfg
 
 
 def parse_policy(p: dict[str, Any], agents: dict[str, Any]) -> PolicyConfig:
+    _only(p, _POLICY, "[policy]")
+    if not isinstance(agents, dict):
+        raise ValueError("[agents] must be a table of agent names")
     policy = PolicyConfig()
     if "tiers" in p:
         policy.tier_effects.update({Tier.parse(k): Effect(v) for k, v in p["tiers"].items()})
     if "assurance" in p:
         policy.tier_assurance.update({Tier.parse(k): Assurance.parse(v) for k, v in p["assurance"].items()})
-    for key in ("approval_timeout_s", "human_hold_s", "suspend_s", "lease_max_s"):
+    for key in ("approval_timeout_s", "human_hold_s", "suspend_s", "lease_max_s", "swap_guard_s"):
         if key in p:
             setattr(policy, key, float(p[key]))
+    if "rules_max_tier" in p:
+        policy.rules_max_tier = Tier.parse(p["rules_max_tier"])
     for key in ("allow_safer_when_frozen", "allow_safer_during_hold"):
         if key in p:
             setattr(policy, key, bool(p[key]))
     if "human_hold_origins" in p:
         policy.human_hold_origins = tuple(p["human_hold_origins"])
-    rate = p.get("rate", {})
+    rate = _only(p.get("rate", {}), _RATE, "[policy.rate]")
     policy.rate_per_agent_per_minute = int(rate.get("per_agent_per_minute", policy.rate_per_agent_per_minute))
     policy.rate_per_thing_per_minute = int(rate.get("per_thing_per_minute", policy.rate_per_thing_per_minute))
     policy.suspend_after_denials_per_minute = int(
         rate.get("suspend_after_denials_per_minute", policy.suspend_after_denials_per_minute))
     if qh := p.get("quiet_hours"):
+        _only(qh, _QUIET, "[policy.quiet_hours]")
+        if "start" not in qh or "end" not in qh:
+            raise ValueError("[policy.quiet_hours] needs start and end, e.g. 23:00 and 07:00")
         policy.quiet_hours = QuietHours(parse_hhmm(qh["start"]), parse_hhmm(qh["end"]),
                                         Tier.parse(qh.get("escalate_from", "T1")))
     for b in p.get("bounds", []):
+        _only(b, _BOUND, "[[policy.bounds]]")
+        if "param" not in b or ("min" not in b and "max" not in b):
+            raise ValueError("[[policy.bounds]] needs param and at least one of min, max")
         policy.bounds.append(Bound(param=b["param"], min=b.get("min"), max=b.get("max"),
                                    thing=b.get("thing", "*"), capability=b.get("capability", "*"),
                                    note=b.get("note", "")))
     for r in p.get("rules", []):
-        policy.rules.append(Rule(
+        _only(r, _OVERRIDE, "[[policy.rules]]")
+        if "effect" not in r:
+            raise ValueError("[[policy.rules]] needs effect = allow, confirm or deny")
+        policy.rules.append(Override(
             effect=Effect(r["effect"]), agent=r.get("agent", "*"), thing=r.get("thing", "*"),
             capability=r.get("capability", "*"), command=r.get("command", "*"),
             min_tier=Tier.parse(r["min_tier"]) if "min_tier" in r else None,
             assurance=Assurance.parse(r["assurance"]) if "assurance" in r else None, note=r.get("note", ""),
         ))
     for name, a in agents.items():
-        policy.agents[name] = AgentPolicy(name=name, max_tier=Tier.parse(a.get("max_tier", "T1")),
-                                          things=tuple(a.get("things", ("*",))), deny=tuple(a.get("deny", ())))
+        if name != "*" and not valid_name(name):
+            raise ValueError(f"[agents.{name!r}]: an agent name is letters, digits, '.', '_' or '-'")
+        _only(a, _AGENT, f"[agents.{name}]")
+        policy.agents[name] = AgentPolicy(
+            name=name, max_tier=Tier.parse(a.get("max_tier", "T1")),
+            things=tuple(a.get("things", ("*",))), deny=tuple(a.get("deny", ())),
+            observe=tuple(a["observe"]) if "observe" in a else None, presence=bool(a.get("presence", True)),
+        )
     if not policy.agents:
         policy.agents["*"] = AgentPolicy("*", max_tier=Tier.T1)
     return policy
@@ -259,6 +364,14 @@ def dev_config(state_dir: Path | None = None) -> FabricConfig:
                    "bounds": [{"capability": "thermostat", "param": "temperature", "min": 16, "max": 25,
                                "note": "comfort band"}]},
         "agents": {"*": {"max_tier": "T3"}},
+        "rules": [
+            {"id": "office-button", "on": {"gesture": "double", "thing": "sim:office.button"},
+             "do": [{"thing": "area:{room}&kind:light", "command": "toggle"}], "run_as": "human",
+             "note": "double press toggles the lights of the room the button is in"},
+            {"id": "leak-shutoff", "on": {"state": "leak", "thing": "kind:sensor", "to": True},
+             "do": [{"thing": "kind:water_main", "command": "close"}], "notify": "critical",
+             "note": "a leak closes the water main"},
+        ],
     }
     return parse(data)
 

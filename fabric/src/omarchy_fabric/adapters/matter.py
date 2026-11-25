@@ -172,6 +172,7 @@ def endpoint_state(clusters: dict[int, dict[int, Any]], caps: list[str]) -> dict
 
 class MatterAdapter(Adapter):
     type = "matter"
+    OPTIONS = frozenset({"url"})
 
     def __init__(self, adapter_id: str, options: dict[str, Any] | None = None):
         super().__init__(adapter_id, options)
@@ -200,6 +201,9 @@ class MatterAdapter(Adapter):
             try:
                 await self._session()
                 attempt = 0
+                # A clean close ends the session without an error; say so at once
+                # instead of leaving things "online" until the next attempt fails.
+                self.fabric.adapter_status(self.id, False, "connection closed")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

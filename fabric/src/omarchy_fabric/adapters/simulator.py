@@ -40,6 +40,7 @@ HOME: list[tuple[str, str, str, str | None, tuple[str, ...], dict[str, Any]]] = 
     ("office.blinds", "Office blinds", "office", "blind", ("cover",), {"position": 100, "cover_state": "open"}),
     ("utility.leak", "Utility room leak sensor", "utility", "sensor", ("leak",), {"leak": False}),
     ("utility.water_main", "Water main valve", "utility", "water_main", ("valve",), {"open": True}),
+    ("office.button", "Office desk button", "office", "button", ("button",), {"pressed": False}),
 ]
 
 LOAD_W = {"kitchen.kettle": 2000.0, "bedroom.heater": 1500.0, "office.plug": 35.0}
@@ -51,6 +52,7 @@ AMBIENT_C = 12.0
 
 class SimulatorAdapter(Adapter):
     type = "simulator"
+    OPTIONS = frozenset({"tick_s", "latency_s", "layout", "things"})
 
     def __init__(self, adapter_id: str, options: dict[str, Any] | None = None):
         super().__init__(adapter_id, options)
@@ -116,6 +118,11 @@ class SimulatorAdapter(Adapter):
 
     def sensor(self, native: str, **attrs: Any) -> None:
         self._push(native, attrs, ORIGIN_DEVICE)
+
+    def gesture(self, native: str, name: str = "single") -> None:
+        """Someone pressed a button: single, double, long..."""
+        if self.fabric:
+            self.fabric.gesture(self.thing_id(native), name)
 
     def set_offline(self, native: str, offline: bool = True) -> None:
         (self.offline.add if offline else self.offline.discard)(native)

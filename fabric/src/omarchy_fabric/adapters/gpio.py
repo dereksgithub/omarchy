@@ -11,6 +11,10 @@ Physical controls are what make the Pi the fabric's trust anchor:
 
 Devices: led / pwm_led / relay (low voltage only) / button / motion (PIR).
 Pins are BCM numbers (GPIO17 = header pin 11). On a Pi 5 gpiozero uses lgpio.
+
+A button with no role is an input for rules: a press is a "single" gesture and a
+hold is "long". Give it `double_s` (say 0.35) to also tell "double" and "triple"
+apart; a single press is then reported that much later.
 """
 
 from __future__ import annotations
@@ -24,12 +28,25 @@ from .base import Adapter, AdapterError
 
 class GpioAdapter(Adapter):
     type = "gpio"
+    OPTIONS = frozenset({"pin_factory", "devices"})
+    DEVICE_OPTIONS = frozenset({"id", "kind", "pin", "role", "name", "area", "active_high", "pull_up", "hold_s",
+                                "load", "thing_kind", "double_s"})
 
     def __init__(self, adapter_id: str, options: dict[str, Any] | None = None):
         super().__init__(adapter_id, options)
         self.specs: list[dict[str, Any]] = list(self.options.get("devices", []))
+        for spec in self.specs:
+            unknown = sorted(set(spec) - self.DEVICE_OPTIONS)
+            if unknown or not {"id", "kind", "pin"} <= set(spec):
+                raise ValueError(f"gpio device {spec.get('id', '?')!r}: needs id, kind and pin"
+                                 + (f"; unknown option(s) {', '.join(unknown)}" if unknown else ""))
+            if spec.get("role", "none") not in ("none", "approve", "kill_switch", "status"):
+                raise ValueError(f"gpio device {spec['id']!r}: unknown role {spec['role']!r}")
         self.devices: dict[str, Any] = {}
         self._held: dict[str, bool] = {}
+        self._double_s: dict[str, float] = {}
+        self._taps: dict[str, int] = {}
+        self._tap_timers: dict[str, asyncio.TimerHandle] = {}
         self._status_leds: list[Any] = []
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -53,6 +70,8 @@ class GpioAdapter(Adapter):
         fabric.adapter_status(self.id, True, f"{len(self.devices)} GPIO device(s)")
 
     async def stop(self) -> None:
+        for timer in self._tap_timers.values():
+            timer.cancel()
         for device in self.devices.values():
             try:
                 device.close()
@@ -83,8 +102,9 @@ class GpioAdapter(Adapter):
         elif kind == "button":
             device = gpiozero.Button(pin, pull_up=spec.get("pull_up", True), bounce_time=None if mock else 0.05,
                                      hold_time=float(spec.get("hold_s", 2.0)))
-            caps, state, thing_kind = ("button",), {"pressed": False}, "sensor"
+            caps, state, thing_kind = ("button",), {"pressed": False}, "button"
             expose = role == "none"
+            self._double_s[dev_id] = float(spec.get("double_s", 0.0))
             device.when_pressed = lambda d=dev_id: self._later(self._pressed, d, role)
             device.when_held = lambda d=dev_id: self._later(self._held_cb, d, role)
             device.when_released = lambda d=dev_id: self._later(self._released, d, role)
@@ -117,16 +137,45 @@ class GpioAdapter(Adapter):
         self._held[dev_id] = True
         if role == "approve":
             self.fabric.presence_deny_all(f"gpio:{dev_id}")
+        elif role == "none":
+            self.fabric.gesture(self.thing_id(dev_id), "long")
 
     def _released(self, dev_id: str, role: str) -> None:
         self._push(dev_id, {"pressed": False}, ORIGIN_HUMAN)
-        if role == "approve" and not self._held.get(dev_id):
+        if self._held.get(dev_id):
+            return
+        if role == "approve":
             self.fabric.presence_press(f"gpio:{dev_id}")
+        elif role == "none":
+            self._tap(dev_id)
+
+    def _tap(self, dev_id: str) -> None:
+        window = self._double_s.get(dev_id, 0.0)
+        if window <= 0 or self._loop is None:
+            self.fabric.gesture(self.thing_id(dev_id), "single")
+            return
+        self._taps[dev_id] = self._taps.get(dev_id, 0) + 1
+        if timer := self._tap_timers.pop(dev_id, None):
+            timer.cancel()
+        self._tap_timers[dev_id] = self._loop.call_later(window, self._flush_taps, dev_id)
+
+    def _flush_taps(self, dev_id: str) -> None:
+        self._tap_timers.pop(dev_id, None)
+        count = self._taps.pop(dev_id, 0)
+        if count:
+            self.fabric.gesture(self.thing_id(dev_id), {1: "single", 2: "double", 3: "triple"}.get(
+                count, f"multi_press_{count}"))
 
     # ------------------------------------------------------------ status LED
     def _on_fabric_event(self, event: dict[str, Any]) -> None:
-        if event.get("type") in ("approval_requested", "approval_resolved", "freeze", "thaw"):
+        kind = event.get("type")
+        if kind in ("approval_requested", "approval_resolved", "freeze", "thaw"):
             self._refresh_led()
+        elif kind == "presence_guarded" and self._loop is not None and not self.fabric.frozen:
+            # The press was refused: three quick flashes, then back to "one is waiting".
+            for led in self._status_leds:
+                led.blink(on_time=0.08, off_time=0.08, n=3)
+            self._loop.call_later(0.6, self._refresh_led)
 
     def _refresh_led(self) -> None:
         pending = len(self.fabric.approvals.pending())
